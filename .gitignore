@@ -1,0 +1,13 @@
+# 依赖与产物
+node_modules/
+*.log
+dsh-memory/
+
+# 原版 jieba 词典（5MB），仅用于重新生成裁剪版，不入库
+data/jieba_dict_raw.txt
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

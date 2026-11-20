@@ -1,0 +1,14 @@
+# 联想记忆（dsh-assoc-mem）bundle 层：插入一行插件。
+# 安装：dsh plugin --profile <配置档> add "link:<本目录绝对路径>"
+- insert:
+    - id: assoc-mem
+      name: 'dsh-assoc-mem'
+      config:
+        enabled: true
+        params:
+          i: 0.005
+          x: 0.03
+          y: 0.06
+          w0: 0.05
+          thr: 0.05
+          wmax: 0.9

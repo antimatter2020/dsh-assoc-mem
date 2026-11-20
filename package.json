@@ -1,0 +1,50 @@
+{
+  "name": "dsh-assoc-mem",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Associative memory for DeepSeek Harness: edge-level co-occurrence graph with Hebbian reinforcement and exponential decay, zero-LLM tokenization. 联想式记忆：边级命中的带权共现图，静默注入。",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "dsh-bundle",
+    "memory",
+    "associative",
+    "记忆",
+    "联想"
+  ],
+  "engines": {
+    "dsh": ">=0.2.2-rc.3 <0.3.0"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "lib/graph.js",
+    "lib/tokenizer.js",
+    "lib/store.js",
+    "lib/retrieve.js",
+    "lib/fragments.js",
+    "data/jieba_dict.txt"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}
