@@ -240,10 +240,12 @@ w_ij^(t+1) = (1-λ)·w_ij^(t) + η·I(v_i, v_j ∈ K_t)
 dsh plugin --profile desktop add "link:<本目录绝对路径>"
 ```
 
-装完重启 DSH。首次加载会读取 349,045 条的 jieba 词典，约 1 秒。
+装完重启 DSH。首次加载会读取裁剪后的 215,038 条名词词典，约 1 秒。
 
 ---
 
 ## 许可
 
-MIT
+[MIT](LICENSE) © 2026 antimatter2020
+
+分词词典裁剪自 [jieba](https://github.com/fxsjy/jieba)（MIT 协议）。
