@@ -275,7 +275,16 @@ export function apply(ctx, config) {
    */
   async function runExplainJob(nouns, edges) {
     await ready
-    if (explainJob.running) { diag.explainSkipped = 'busy'; return }
+    // 卡死保护：流如果不返回 finish，running 会永远是 true，
+    // 之后每一轮都被 busy 挡掉（实测踩过）。超过 90 秒一律当它死了。
+    const STALE = 90 * 1000
+    if (explainJob.running) {
+      if (Date.now() - (explainJob.startedAt || 0) < STALE) {
+        diag.explainSkipped = 'busy'
+        return
+      }
+      diag.explainSkipped = 'stale-reclaimed'
+    }
 
     // 每次开跑先清掉上一轮的残留，否则 diag 会一直显示旧错误，
     // 让人误以为配置没生效（这轮就踩过这个坑）。
@@ -287,6 +296,7 @@ export function apply(ctx, config) {
     diag.explainReplyLen = 0
 
     explainJob.running = true
+    explainJob.startedAt = Date.now()
     explainJob.lastAt = Date.now()
     let ok = false
     try {
@@ -330,15 +340,31 @@ export function apply(ctx, config) {
       diag.explainProvider = provider
       diag.explainModel = model
 
-      const stream = llm.stream({
-        provider,
-        model,
-        system,
-        messages: [{ role: 'user', content: [{ type: 'text', text: user }] }],
-        temperature: 0,
-        maxTokens: 800,
-      })
-      const { text, failure } = await collectStream(stream)
+      // 主动超时：不给流无限等待的机会。
+      // 之前有请求挂住不返回 finish，导致 running 永远为 true、
+      // 后续每一轮都被 busy 挡掉，看起来就是「彻底不动了」。
+      const ac = new AbortController()
+      const timer = setTimeout(() => { try { ac.abort() } catch { /* 已结束 */ } }, 60 * 1000)
+      let text = ''
+      let failure = null
+      try {
+        const stream = llm.stream({
+          provider,
+          model,
+          system,
+          messages: [{ role: 'user', content: [{ type: 'text', text: user }] }],
+          temperature: 0,
+          maxTokens: 800,
+          signal: ac.signal,
+        })
+        const r = await collectStream(stream)
+        text = r.text
+        failure = r.failure
+      } catch (e) {
+        failure = failure || { message: messageOf(e) }
+      } finally {
+        clearTimeout(timer)
+      }
       if (failure) {
         // 不 return，让 finally 里的「失败解除冷却」生效
         diag.explainError = 'llm-failed: ' + (failure.message || failure.code || '')
