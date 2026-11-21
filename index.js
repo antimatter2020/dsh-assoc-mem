@@ -357,7 +357,15 @@ export function apply(ctx, config) {
           maxTokens: 800,
           signal: ac.signal,
         })
-        const r = await collectStream(stream)
+        // 硬超时：不指望 adapter 一定尊重 signal。
+        // 用 Promise.race 兜住「流永不返回」的情况，否则任务会永远挂着，
+        // 连带 running 标志不释放，后续每轮都被 busy 挡掉。
+        const r = await Promise.race([
+          collectStream(stream),
+          new Promise((resolve) => {
+            setTimeout(() => resolve({ text: '', failure: { message: 'stream-timeout' } }), 60 * 1000)
+          }),
+        ])
         text = r.text
         failure = r.failure
       } catch (e) {
