@@ -32,6 +32,8 @@
     "lib/tokenizer.js",
     "lib/store.js",
     "lib/retrieve.js",
+    "lib/gloss.js",
+    "lib/explain.js",
     "lib/fragments.js",
     "data/jieba_dict.txt"
   ],

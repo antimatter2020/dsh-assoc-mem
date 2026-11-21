@@ -33,7 +33,8 @@ import { fileURLToPath } from 'node:url'
 import { Store } from './lib/store.js'
 import { Tokenizer } from './lib/tokenizer.js'
 import { buildInjection, previewLines } from './lib/retrieve.js'
-import { buildGlossInstruction, parseGlossReply, hasGlossSection, buildEdgeInstruction, parseEdgeReply } from './lib/gloss.js'
+import { parseGlossReply, GLOSS_COOLDOWN_TURNS } from './lib/gloss.js'
+import { buildExplainRequest, parseExplainReply, collectStream, EXPLAIN_LIMITS } from './lib/explain.js'
 import { splitParagraphs, userFragment } from './lib/fragments.js'
 
 const BASE = '/dsh-assoc-mem'
@@ -43,6 +44,9 @@ const SECTION_ORDER = 860
 const here = path.dirname(fileURLToPath(import.meta.url))
 const DICT_FILE = path.join(here, 'data', 'jieba_dict.txt')
 
+// llm 走 ctx.get('llm') 可选获取，不写进 inject：
+// inject 里写对象形式在 Cordis 上不保证被接受，写错会导致整个插件加载失败，
+// 而解释生成本来就是可选能力，没有 llm 也该能正常记共现。
 export const inject = ['webServer', 'systemPrompt']
 
 function sendJson(res, code, body) {
@@ -143,10 +147,17 @@ export function apply(ctx, config) {
     if (config && typeof config.workspace === 'string' && config.workspace.trim()) return config.workspace.trim()
     try { return process.cwd() } catch { return '' }
   })()
+  // 冷却是程序内部的相对计数，但必须跨重启延续：
+  // 若重启后从 0 重新数，旧记录里的轮次会比当前还大，
+  // 冷却判定会误判成「刚催过」，所有条目又被锁 10 轮。
+  const turn = { n: 0 }
+
   const store = new Store({ ...(config || {}), workspace })
   const tokenizer = new Tokenizer({ dictPath: DICT_FILE })
   const ready = (async () => {
     await store.init()
+    // 恢复对话轮次计数：必须在 init 之后，因为要从记忆文件里读
+    turn.n = Number.isFinite(store.state.turnCount) ? store.state.turnCount : 0
     tokenizer.extraWords = new Set(store.custom)
     tokenizer.blocked = new Set(store.blocked)
     tokenizer.customConcepts = new Set(store.custom)
@@ -215,6 +226,8 @@ export function apply(ctx, config) {
       }
       store.dirty = true
     }
+    // 挂到 store 上，注入段落才拿得到「本轮新增、还没解释的边」。
+    store.pendingEdges = pendingEdges
     return { fragments: frags.length, added, hit, pendingEdges }
   }
 
@@ -249,54 +262,99 @@ export function apply(ctx, config) {
   // 已处理过的消息指纹，避免同一段文字被重复摄入
   const seen = new Set()
   const diag = { sectionCalls: 0, lastUserLen: 0, lastInjectedLen: 0, lastError: '', hasLogger: false }
-  // 名词解释的遵守情况：上一轮发了指令，这一轮检查助手回复里有没有「补充解释：」
-  const glossState = { askedRound: -1, strike: 0, lastAsked: [] }
+  // 解释任务：插件自己向 LLM 请求，不再依赖主对话模型写段落。
+  // 同时只跑一个任务，避免连续多轮叠出并发请求。
+  const explainJob = { running: false, lastAt: 0 }
 
-  /** 扫最近一条助手回复，判断上一轮指令有没有被执行 */
-  function checkGlossCompliance(context) {
-    if (glossState.askedRound < 0) return
+  /**
+   * 后台请求解释：名词 + 边**一次问完、一次收回**。
+   *
+   * 这是本轮重构的核心。以前靠系统提示让主对话模型在回复末尾写
+   * 「补充解释：」「关系解释：」，但它经常漏写关系段，插件只能干等。
+   * 现在改成插件自己调 ctx.llm.stream()，模型没有「不写」的余地。
+   */
+  async function runExplainJob(nouns, edges) {
+    await ready
+    const llm = ctx.get?.('llm') ?? ctx.llm
+    if (!llm || typeof llm.stream !== 'function') {
+      diag.explainError = 'llm-service-unavailable'
+      return
+    }
+    if (explainJob.running) { diag.explainSkipped = 'busy'; return }
+    explainJob.running = true
+    explainJob.lastAt = Date.now()
     try {
-      const agent = context && (context.agent || context.scope)
-      const log = agent && agent.session && agent.session.log
-      if (!Array.isArray(log)) return
-      for (let i = log.length - 1; i >= Math.max(0, log.length - 60); i -= 1) {
-        const ev = log[i]
-        if (!ev || ev.type !== 'assistant/message') continue
-        const data = ev.data || {}
-        const msg = data.message || data
-        const content = msg && msg.content
-        let text = ''
-        if (typeof content === 'string') text = content
-        else if (Array.isArray(content)) {
-          text = content.map((b) => (b && typeof b.text === 'string' ? b.text : '')).join('\n')
-        }
-        if (!text) continue
-        if (hasGlossSection(text)) {
-          glossState.strike = 0
-          // 关键：把「补充解释」段落解析出来，写进词典
-          const { items, rejects } = parseGlossReply(text)
-          let changed = false
-          for (const it of items) { store.setGloss(it.word, it.gloss); changed = true }
-          for (const w of rejects) { store.reject(w); changed = true }
-          // 边解释
-          const edges = parseEdgeReply(text)
-          for (const e of edges) {
-            const key = e.a < e.b ? e.a + '\u0000' + e.b : e.b + '\u0000' + e.a
-            const edge = store.graph.edges.get(key)
-            if (edge) { edge.gloss = e.gloss; edge.glossKind = 'llm'; changed = true }
-          }
-          diag.lastParsedEdge = edges.length
-          if (changed) {
-            store.save().catch((e) => ctx.logger?.warn?.('[assoc-mem] 解释落盘失败：' + messageOf(e)))
-            diag.lastParsedGloss = items.length
-            diag.lastRejected = rejects.length
-          }
-        } else {
-          glossState.strike += 1
-        }
+      const { system, user } = buildExplainRequest({ nouns, edges })
+      if (!system && !user) return
+
+      // 模型路由：优先用面板里手动配置的，没配才退回当前默认模型。
+      // 手动配置存在的意义就是不必猜默认模型对象长什么样。
+      let provider = String(store.state.explainProvider || '').trim()
+      let model = String(store.state.explainModel || '').trim()
+      if (!provider || !model) {
+        const sel = (() => {
+          try { return ctx.get?.('agentDefaultModel')?.currentSelection?.() || {} } catch { return {} }
+        })()
+        provider = provider || sel.provider || sel.route?.provider || ''
+        model = model || sel.model || sel.route?.model || ''
+        diag.explainFrom = 'default'
+      } else {
+        diag.explainFrom = 'config'
+      }
+      if (!provider || !model) {
+        diag.explainError = 'no-model-configured'
         return
       }
-    } catch { /* 读不到就当作没漏 */ }
+
+      diag.explainProvider = provider
+      diag.explainModel = model
+
+      const stream = llm.stream({
+        provider,
+        model,
+        system,
+        messages: [{ role: 'user', content: [{ type: 'text', text: user }] }],
+        temperature: 0,
+        maxTokens: 800,
+      })
+      const { text, failure } = await collectStream(stream)
+      if (failure) { diag.explainError = 'llm-failed: ' + (failure.message || ''); return }
+
+      diag.explainReplyLen = text.length
+
+      const parsed = parseExplainReply(text, { nouns, edges })
+      diag.explainNouns = parsed.nouns.length
+      diag.explainEdges = parsed.edges.length
+
+      let changed = false
+      for (const it of parsed.nouns) {
+        if (it.reject) { store.reject(it.word); changed = true }
+        else { store.setGloss(it.word, it.gloss); changed = true }
+      }
+      for (const e of parsed.edges) {
+        const key = e.a < e.b ? e.a + '\u0000' + e.b : e.b + '\u0000' + e.a
+        const edge = store.graph.edges.get(key)
+        if (edge) { edge.gloss = e.gloss; edge.glossKind = 'llm'; changed = true }
+      }
+
+      // 没拿到的条目解除冷却，下一轮立刻能再问——
+      // 不能让一次失败的请求把它们锁死 10 轮。
+      const gotNouns = new Set(parsed.nouns.map((x) => x.word))
+      const gotEdges = new Set(parsed.edges.map((x) => x.a + '|' + x.b))
+      const missedNouns = nouns.filter((n) => !gotNouns.has(n))
+      const missedEdges = edges.filter((e) =>
+        !gotEdges.has(e.a + '|' + e.b) && !gotEdges.has(e.b + '|' + e.a))
+      if (missedNouns.length) store.unmarkAsked(missedNouns, [])
+      if (missedEdges.length) store.unmarkAsked([], missedEdges)
+      diag.explainMissed = missedNouns.length + missedEdges.length
+
+      if (changed || missedNouns.length || missedEdges.length) await store.save()
+      diag.explainAt = new Date().toISOString()
+    } catch (e) {
+      diag.explainError = messageOf(e)
+    } finally {
+      explainJob.running = false
+    }
   }
 
   const promptService = ctx.get?.('systemPrompt') ?? ctx.systemPrompt
@@ -318,6 +376,10 @@ export function apply(ctx, config) {
           if (!seen.has(fingerprint)) {
             seen.add(fingerprint)
             if (seen.size > 400) seen.clear()
+            // 见到一条新的用户消息，才是一个新轮次
+            turn.n += 1
+            // 轮次计数跨重启延续，否则旧记录会误判成「刚催过」
+            store.state.turnCount = turn.n
             try {
               const r = ingestSync(userText, 1)
               diag.lastIngest = r
@@ -331,21 +393,36 @@ export function apply(ctx, config) {
 
           const pending = store.pendingGloss()
           store.graph.params.edgeMode = store.state.edgeMode || 'context'
-          checkGlossCompliance(context)
-          const glossHint = store.state.glossMode === 'llm'
-            ? buildGlossInstruction(pending, glossState.strike)
-            : ''
-          const edgeHint = store.state.glossMode === 'llm' && store.graph.params.edgeMode === 'llm'
-            ? buildEdgeInstruction(store.pendingEdges || [])
-            : ''
-          if (pending.length) {
-            glossState.askedRound = store.graph.round
-            glossState.lastAsked = pending.slice()
+
+          // 解释改由插件自己向 LLM 请求，不再要求主对话模型写段落。
+          // 这里只负责「排队」：把本轮该问的条目挑出来交给后台任务。
+          const nounCandidates = store.state.glossMode === 'llm' ? pending : []
+          const edgeCandidates = store.state.glossMode === 'llm' &&
+            store.graph.params.edgeMode === 'llm' &&
+            Array.isArray(store.pendingEdges) ? store.pendingEdges : []
+
+          // 逐条冷却：前 GLOSS_COOLDOWN_TURNS 轮内问过的那一条跳过，不影响其它条目
+          const round = turn.n
+          const freshNouns = store.freshNouns(nounCandidates, round, GLOSS_COOLDOWN_TURNS)
+          const freshEdges = store.freshEdges(edgeCandidates, round, GLOSS_COOLDOWN_TURNS)
+
+          if (freshNouns.length || freshEdges.length) {
+            store.markAsked(freshNouns, freshEdges, round)
+            store.save().catch((e) =>
+              ctx.logger?.warn?.('[assoc-mem] 轮次落盘失败：' + messageOf(e)))
+            // 不阻塞本轮注入：后台跑，结果回来自己入库
+            void runExplainJob(freshNouns, freshEdges)
           }
-          diag.glossStrike = glossState.strike
-          const raw = buildInjection(store, tokenizer, userText)
-          const out = [glossHint, edgeHint, raw].filter(Boolean).join('\n\n')
+
+          diag.round = round
           diag.pendingGloss = pending.length
+          diag.glossCooling = Math.max(0, nounCandidates.length - freshNouns.length) +
+            Math.max(0, edgeCandidates.length - freshEdges.length)
+          diag.lastAskedNouns = freshNouns.length
+          diag.lastAskedEdges = freshEdges.length
+
+          // 注入内容只剩记忆本身，不再有催办文案——省掉的正是这段 token
+          const out = buildInjection(store, tokenizer, userText)
           diag.lastInjectedLen = out.length
           diag.lastError = out ? 'ok' : 'empty-injection'
           return out
@@ -415,11 +492,25 @@ export function apply(ctx, config) {
         name: n.name,
         gloss: n.gloss,
         manual: n.manual,
-        neighbours: nb.map((x) => ({
-          name: x.name,
-          w: Number(x.w.toFixed(4)),
-          gloss: (store.nodes.get(x.name)?.gloss || []).map((g) => g.text).join(' / '),
-        })),
+        neighbours: nb.map((x) => {
+          // 这一栏是「边」的信息，不是邻居词的词典释义：
+          // 取这条边自己的关系解释，没有才退回邻居的概念解释。
+          const key = name < x.name
+            ? name + '\u0000' + x.name
+            : x.name + '\u0000' + name
+          const edge = store.graph.edges.get(key)
+          const edgeGloss = (edge && edge.gloss) || ''
+          const nodeGloss = (store.nodes.get(x.name)?.gloss || [])
+            .map((g) => g.text).join(' / ')
+          return {
+            name: x.name,
+            w: Number(x.w.toFixed(4)),
+            dist: edge && Number.isFinite(edge.dist) ? edge.dist : 9999,
+            edgeGloss,
+            edgeGlossKind: (edge && edge.glossKind) || '',
+            gloss: edgeGloss || nodeGloss,
+          }
+        }),
       })
     } catch (e) { sendJson(res, 500, { error: messageOf(e) }) }
   })
@@ -506,6 +597,18 @@ export function apply(ctx, config) {
         store.graph.params.edgeMode = m
         await store.save()
       }
+      sendJson(res, 200, store.snapshot())
+    } catch (e) { sendJson(res, 500, { error: messageOf(e) }) }
+  })
+
+  route('/explain-model', async (req, res) => {
+    if (!guard(req, res, 'POST')) return
+    try {
+      await ready
+      const body = await readBody(req)
+      store.state.explainProvider = String(body.provider || '').trim()
+      store.state.explainModel = String(body.model || '').trim()
+      await store.save()
       sendJson(res, 200, store.snapshot())
     } catch (e) { sendJson(res, 500, { error: messageOf(e) }) }
   })

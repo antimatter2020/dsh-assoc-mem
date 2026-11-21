@@ -215,17 +215,21 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function Detail({ data, onGloss, onReject, onRemove, busy }) {
+    function Detail({ data, onGloss, onReject, busy }) {
       const [text, setText] = useState('')
       if (!data) return h('div', { className: 'asm-empty' }, '从左侧选一个概念')
-      const maxW = Math.max(0.001, ...data.neighbours.map((n) => n.w))
+      // 详情接口可能返回 {error}（概念刚被屏蔽、或记忆已切换），
+      // 这里必须先判空，否则 .map 抛异常会让整个面板掉线。
+      const neighbours = Array.isArray(data.neighbours) ? data.neighbours : []
+      const glossList = Array.isArray(data.gloss) ? data.gloss : []
+      const maxW = Math.max(0.001, ...neighbours.map((n) => n.w))
       return h('div', { className: 'asm-detailpad' },
-        h('div', { className: 'asm-h2' }, data.name),
+        h('div', { className: 'asm-h2' }, data.name || ''),
         h('div', { className: 'asm-meta' },
-          data.neighbours.length + ' 条关联' + (data.manual ? ' · 手动添加' : '')),
+          neighbours.length + ' 条关联' + (data.manual ? ' · 手动添加' : '')),
         h('div', { className: 'asm-label' }, '解释（一词多义时可追加多条）'),
-        data.gloss.length
-          ? data.gloss.map((g, i) => h('div', { key: i, className: 'asm-gloss' },
+        glossList.length
+          ? glossList.map((g, i) => h('div', { key: i, className: 'asm-gloss' },
               h('span', { className: 'asm-gloss-text' }, g.text),
               h('span', { className: 'asm-gloss-time' }, new Date(g.t).toLocaleDateString('zh-CN')),
             ))
@@ -249,27 +253,31 @@ window.__ModuleLoader__.load({
             disabled: busy,
             onClick: () => onReject(data.name),
           }, '不是概念，屏蔽'),
-          h('button', {
-            className: 'asm-btn',
-            'data-danger': 'true',
-            disabled: busy,
-            onClick: () => onRemove(data.name),
-          }, '删除'),
         ),
         h('div', { className: 'asm-label' }, '关联概念（1 hop）'),
-        data.neighbours.length
-          ? data.neighbours.map((n) => h('div', { key: n.name, className: 'asm-nb' },
+        neighbours.length
+          ? neighbours.map((n) => h('div', { key: n.name, className: 'asm-nb' },
               h('span', { className: 'asm-nb-name' }, n.name),
               h('span', { className: 'asm-bar' },
                 h('span', { className: 'asm-bar-in', style: { width: (n.w / maxW * 100) + '%' } })),
-              h('span', { className: 'asm-nb-gloss' }, n.gloss || ''),
+              // 显示这条「边」的关系解释，而不是邻居词的词典释义
+              h('span', { className: 'asm-nb-gloss' }, n.edgeGloss || ''),
             ))
           : h('div', { className: 'asm-meta' }, '暂无过线关联'),
       )
     }
 
-    function Side({ state, onParam, onToggle, onGlossMode, onGlossClear, onEdgeMode, onMemOpen, onMemNew, onMemDel, memories, busy }) {
+    function Side({ state, onParam, onToggle, onGlossMode, onGlossClear, onEdgeMode, onMemOpen, onMemNew, onMemDel, onExplainModel, memories, busy }) {
       const [newName, setNewName] = useState('')
+      const [pv, setPv] = useState('')
+      const [pm, setPm] = useState('')
+      const [pmInit, setPmInit] = useState(false)
+      useEffect(() => {
+        if (!state || pmInit) return
+        setPv(state.explainProvider || '')
+        setPm(state.explainModel || '')
+        setPmInit(true)
+      }, [state, pmInit])
       if (!state) return h('div', { className: 'asm-empty' }, '读取中…')
       const s = state.stats || {}
       const p = state.params || {}
@@ -344,6 +352,35 @@ window.__ModuleLoader__.load({
               state.warnings.map((w, i) => h('div', { key: i, className: 'asm-warn' }, w)))
           : null,
         h('div', { className: 'asm-side-sec' },
+          h('div', { className: 'asm-label' }, '解释请求使用的模型'),
+          h('div', { className: 'asm-meta', style: { marginBottom: '6px' } },
+            '插件自己向 LLM 请求解释时用哪个模型。留空则尝试用当前默认模型。'),
+          h('div', { className: 'asm-inline' },
+            h('input', {
+              placeholder: 'provider，如 deepseek',
+              value: pv,
+              disabled: busy,
+              onChange: (e) => setPv(e.target.value),
+            }),
+          ),
+          h('div', { className: 'asm-inline' },
+            h('input', {
+              placeholder: 'model，如 deepseek-chat',
+              value: pm,
+              disabled: busy,
+              onChange: (e) => setPm(e.target.value),
+            }),
+          ),
+          h('div', { className: 'asm-row' },
+            h('button', {
+              className: 'asm-btn',
+              'data-primary': 'true',
+              disabled: busy,
+              onClick: () => onExplainModel(pv.trim(), pm.trim()),
+            }, '保存模型'),
+          ),
+        ),
+        h('div', { className: 'asm-side-sec' },
           h('div', { className: 'asm-label' }, '名词解释来源'),
           h('div', { className: 'asm-mode' },
             h('button', {
@@ -361,7 +398,7 @@ window.__ModuleLoader__.load({
           ),
           state.glossMode === 'llm'
             ? h('div', { className: 'asm-cost' },
-                '已切换到模型生成模式：每写一个名词解释约消耗 60–90 token，新词多时开销明显。切回左侧「上下文截取」即可零消耗。')
+                '模型生成模式：插件自己在后台向 LLM 请求解释，名词和边一次问完。主对话模型不需要在回复里写任何段落。')
             : null,
         ),
         h('div', { className: 'asm-side-sec' },
@@ -432,7 +469,9 @@ window.__ModuleLoader__.load({
 
       const pick = (name) => {
         setActive(name)
-        api.get('/node', { name }).then(setDetail).catch(() => setDetail(null))
+        api.get('/node', { name })
+          .then((d) => setDetail(d && !d.error ? d : null))
+          .catch(() => setDetail(null))
       }
 
       const act = async (fn, ok) => {
@@ -488,8 +527,10 @@ window.__ModuleLoader__.load({
               h(Detail, {
                 data: detail, busy,
                 onGloss: (name, text) => act(() => api.post('/gloss', { name, text }), '已追加'),
-                onReject: (name) => act(() => api.post('/reject', { name }).then(() => { setDetail(null); setActive('') }), '已屏蔽'),
-                onRemove: (name) => act(() => api.post('/remove', { name }).then(() => { setDetail(null); setActive('') }), '已删除'),
+                onReject: (name) => act(
+                  () => api.post('/reject', { name }).then(() => { setDetail(null); setActive('') }),
+                  '已屏蔽',
+                ),
               }),
             ),
             h('div', { className: 'asm-col asm-col-side' },
@@ -518,6 +559,12 @@ window.__ModuleLoader__.load({
                   const snap = await api.post('/edge-mode', { mode })
                   setState(snap)
                   setToast(mode === 'llm' ? '边解释：模型生成' : '边解释：上下文截取')
+                }),
+                onExplainModel: (provider, model) => act(async () => {
+                  const snap = await api.post('/explain-model', { provider, model })
+                  if (snap.error) { setToast('保存失败：' + snap.error); return }
+                  setState(snap)
+                  setToast(provider && model ? '已设为 ' + provider + ' / ' + model : '已清空，改用默认模型')
                 }),
                 onGlossClear: () => act(async () => {
                   const r = await api.post('/gloss-clear', {})
