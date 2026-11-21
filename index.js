@@ -275,28 +275,49 @@ export function apply(ctx, config) {
    */
   async function runExplainJob(nouns, edges) {
     await ready
-    const llm = ctx.get?.('llm') ?? ctx.llm
-    if (!llm || typeof llm.stream !== 'function') {
-      diag.explainError = 'llm-service-unavailable'
-      return
-    }
     if (explainJob.running) { diag.explainSkipped = 'busy'; return }
+
+    // 每次开跑先清掉上一轮的残留，否则 diag 会一直显示旧错误，
+    // 让人误以为配置没生效（这轮就踩过这个坑）。
+    diag.explainError = ''
+    diag.explainSkipped = ''
+    diag.explainNouns = 0
+    diag.explainEdges = 0
+    diag.explainMissed = 0
+    diag.explainReplyLen = 0
+
     explainJob.running = true
     explainJob.lastAt = Date.now()
+    let ok = false
     try {
+      const llm = ctx.get?.('llm') ?? ctx.llm
+      if (!llm || typeof llm.stream !== 'function') {
+        diag.explainError = 'llm-service-unavailable'
+        return
+      }
       const { system, user } = buildExplainRequest({ nouns, edges })
-      if (!system && !user) return
+      if (!system && !user) { ok = true; return }
 
-      // 模型路由：优先用面板里手动配置的，没配才退回当前默认模型。
-      // 手动配置存在的意义就是不必猜默认模型对象长什么样。
+      // 模型路由：优先用面板里手动配置的，没配才用当前默认模型。
+      // 默认模型对象的字段名不可靠猜测，所以这里把整个对象记进 diag，
+      // 拿不到时能直接看到它长什么样，而不是只看到一个 'no-model-configured'。
       let provider = String(store.state.explainProvider || '').trim()
       let model = String(store.state.explainModel || '').trim()
       if (!provider || !model) {
-        const sel = (() => {
-          try { return ctx.get?.('agentDefaultModel')?.currentSelection?.() || {} } catch { return {} }
-        })()
-        provider = provider || sel.provider || sel.route?.provider || ''
-        model = model || sel.model || sel.route?.model || ''
+        let sel = {}
+        try { sel = ctx.get?.('agentDefaultModel')?.currentSelection?.() || {} } catch { sel = {} }
+        diag.explainSelection = sel
+        const pick = (obj, keys) => {
+          for (const k of keys) {
+            const v = obj && obj[k]
+            if (typeof v === 'string' && v.trim()) return v.trim()
+          }
+          return ''
+        }
+        provider = provider || pick(sel, ['provider', 'providerId'])
+        model = model || pick(sel, ['model', 'modelId'])
+        if (!provider) provider = pick(sel.route || {}, ['provider', 'providerId'])
+        if (!model) model = pick(sel.route || {}, ['model', 'modelId'])
         diag.explainFrom = 'default'
       } else {
         diag.explainFrom = 'config'
@@ -318,7 +339,11 @@ export function apply(ctx, config) {
         maxTokens: 800,
       })
       const { text, failure } = await collectStream(stream)
-      if (failure) { diag.explainError = 'llm-failed: ' + (failure.message || ''); return }
+      if (failure) {
+        // 不 return，让 finally 里的「失败解除冷却」生效
+        diag.explainError = 'llm-failed: ' + (failure.message || failure.code || '')
+        return
+      }
 
       diag.explainReplyLen = text.length
 
@@ -350,10 +375,18 @@ export function apply(ctx, config) {
 
       if (changed || missedNouns.length || missedEdges.length) await store.save()
       diag.explainAt = new Date().toISOString()
+      ok = true
     } catch (e) {
       diag.explainError = messageOf(e)
     } finally {
       explainJob.running = false
+      // 整体失败（配置错、服务不可用、抛异常）时，把所有条目解除冷却。
+      // 否则一次失败会把它们锁 10 轮，用户看到的就是「问过但永远没有解释」。
+      if (!ok) {
+        store.unmarkAsked(nouns, edges)
+        diag.explainMissed = (nouns ? nouns.length : 0) + (edges ? edges.length : 0)
+        store.save().catch(() => {})
+      }
     }
   }
 
@@ -599,6 +632,23 @@ export function apply(ctx, config) {
       }
       sendJson(res, 200, store.snapshot())
     } catch (e) { sendJson(res, 500, { error: messageOf(e) }) }
+  })
+
+  route('/explain-reset', async (req, res) => {
+    if (!guard(req, res, 'POST')) return
+    try {
+      await ready
+      // 清空所有逐条冷却记录。请求失败过的条目会一直占着冷却位，
+      // 修好配置后需要一次性放开，否则要等 10 轮才重问。
+      const n = Object.keys(store.state.glossAsked || {}).length
+      const e = Object.keys(store.state.edgeAsked || {}).length
+      store.state.glossAsked = {}
+      store.state.edgeAsked = {}
+      store.dirty = true
+      await store.save()
+      diag.explainError = ''
+      sendJson(res, 200, { cleared: n + e, glossAsked: n, edgeAsked: e })
+    } catch (err) { sendJson(res, 500, { error: messageOf(err) }) }
   })
 
   route('/explain-model', async (req, res) => {

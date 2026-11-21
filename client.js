@@ -267,7 +267,7 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function Side({ state, onParam, onToggle, onGlossMode, onGlossClear, onEdgeMode, onMemOpen, onMemNew, onMemDel, onExplainModel, memories, busy }) {
+    function Side({ state, onParam, onToggle, onGlossMode, onGlossClear, onEdgeMode, onMemOpen, onMemNew, onMemDel, onExplainModel, onExplainReset, memories, busy }) {
       const [newName, setNewName] = useState('')
       const [pv, setPv] = useState('')
       const [pm, setPm] = useState('')
@@ -378,6 +378,11 @@ window.__ModuleLoader__.load({
               disabled: busy,
               onClick: () => onExplainModel(pv.trim(), pm.trim()),
             }, '保存模型'),
+            h('button', {
+              className: 'asm-btn',
+              disabled: busy,
+              onClick: onExplainReset,
+            }, '重置冷却'),
           ),
         ),
         h('div', { className: 'asm-side-sec' },
@@ -559,6 +564,11 @@ window.__ModuleLoader__.load({
                   const snap = await api.post('/edge-mode', { mode })
                   setState(snap)
                   setToast(mode === 'llm' ? '边解释：模型生成' : '边解释：上下文截取')
+                }),
+                onExplainReset: () => act(async () => {
+                  const r = await api.post('/explain-reset', {})
+                  if (r.error) { setToast('重置失败：' + r.error); return }
+                  setToast('已放开 ' + (r.cleared || 0) + ' 条冷却记录')
                 }),
                 onExplainModel: (provider, model) => act(async () => {
                   const snap = await api.post('/explain-model', { provider, model })
