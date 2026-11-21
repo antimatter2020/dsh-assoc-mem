@@ -483,8 +483,13 @@ export function apply(ctx, config) {
             // 不在这里 markAsked：要等请求真的有结果再记。
             // 提前记的话，一次失败就把这些条目锁 10 轮，
             // 表现就是「问过却永远没有解释」——这个坑已经踩过两次了。
-            // 不阻塞本轮注入：后台跑，结果回来自己入库、自己记冷却。
-            void runExplainJob(freshNouns, freshEdges)
+            //
+            // 注意 section 一轮会被调用多次（组装提示词时反复求值），
+            // 这里必须按轮次去重，否则第二次就撞上 busy 白白跳过。
+            if (explainJob.lastRound !== round) {
+              explainJob.lastRound = round
+              void runExplainJob(freshNouns, freshEdges)
+            }
           }
 
           diag.round = round
