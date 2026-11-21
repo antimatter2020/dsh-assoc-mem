@@ -15,3 +15,7 @@ Thumbs.db
 # 本地交接文档，不入公开仓库
 HANDOFF.md
 PROJECT_LOG.md
+
+# 临时脚本
+_commit.mjs
+.git-msg-tmp.txt
