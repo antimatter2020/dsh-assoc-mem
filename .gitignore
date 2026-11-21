@@ -11,3 +11,7 @@ data/jieba_dict_raw.txt
 Thumbs.db
 .vscode/
 .idea/
+
+# 本地交接文档，不入公开仓库
+HANDOFF.md
+PROJECT_LOG.md
