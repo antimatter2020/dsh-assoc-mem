@@ -268,7 +268,7 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function Side({ state, onParam, onToggle, onGlossMode, onGlossClear, onMemOpen, onMemNew, onMemDel, memories, busy }) {
+    function Side({ state, onParam, onToggle, onGlossMode, onGlossClear, onEdgeMode, onMemOpen, onMemNew, onMemDel, memories, busy }) {
       const [newName, setNewName] = useState('')
       if (!state) return h('div', { className: 'asm-empty' }, '读取中…')
       const s = state.stats || {}
@@ -362,6 +362,27 @@ window.__ModuleLoader__.load({
           state.glossMode === 'llm'
             ? h('div', { className: 'asm-cost' },
                 '已切换到模型生成模式：每写一个名词解释约消耗 60–90 token，新词多时开销明显。切回左侧「上下文截取」即可零消耗。')
+            : null,
+        ),
+        h('div', { className: 'asm-side-sec' },
+          h('div', { className: 'asm-label' }, '边解释（两词关系）'),
+          h('div', { className: 'asm-mode' },
+            h('button', {
+              'data-active': (state.edgeMode || 'context') === 'context' ? 'true' : 'false',
+              onClick: () => onEdgeMode('context'),
+            },
+              h('b', null, '上下文截取'),
+              h('span', null, '20 token 内的原文')),
+            h('button', {
+              'data-active': state.edgeMode === 'llm' ? 'true' : 'false',
+              onClick: () => onEdgeMode('llm'),
+            },
+              h('b', null, '模型生成'),
+              h('span', null, '让模型描述关系')),
+          ),
+          state.edgeMode === 'llm'
+            ? h('div', { className: 'asm-cost' },
+                '该模式每轮会额外消耗 token 描述新边关系。')
             : null,
         ),
         h('div', { className: 'asm-side-sec' },
@@ -493,6 +514,11 @@ window.__ModuleLoader__.load({
                 }),
                 onParam: (k, v) => act(() => api.post('/params', { [k]: v }).then(setState)),
                 onGlossMode: (mode, tokens) => act(() => api.post('/gloss-mode', { mode, tokens }).then(setState)),
+                onEdgeMode: (mode) => act(async () => {
+                  const snap = await api.post('/edge-mode', { mode })
+                  setState(snap)
+                  setToast(mode === 'llm' ? '边解释：模型生成' : '边解释：上下文截取')
+                }),
                 onGlossClear: () => act(async () => {
                   const r = await api.post('/gloss-clear', {})
                   setState(await api.get('/state'))

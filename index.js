@@ -33,7 +33,7 @@ import { fileURLToPath } from 'node:url'
 import { Store } from './lib/store.js'
 import { Tokenizer } from './lib/tokenizer.js'
 import { buildInjection, previewLines } from './lib/retrieve.js'
-import { buildGlossInstruction, parseGlossReply, hasGlossSection } from './lib/gloss.js'
+import { buildGlossInstruction, parseGlossReply, hasGlossSection, buildEdgeInstruction, parseEdgeReply } from './lib/gloss.js'
 import { splitParagraphs, userFragment } from './lib/fragments.js'
 
 const BASE = '/dsh-assoc-mem'
@@ -167,7 +167,9 @@ export function apply(ctx, config) {
       const words = [...new Set(spans.map((x) => x.word))]
       if (words.length < 2) continue
       for (const w of words) store.node(w)
-      const r = store.graph.ingest(words, s)
+      const positions = new Map()
+      for (const sp of spans) if (!positions.has(sp.word)) positions.set(sp.word, { start: sp.start, end: sp.end })
+      const r = store.graph.ingest(words, s, { positions, text: frag })
       added += r.added
       hit += r.hit
       for (const sp of spans) {
@@ -191,14 +193,19 @@ export function apply(ctx, config) {
     const frags = userFragment(text)
     let added = 0
     let hit = 0
+    let pendingEdges = []
     for (const frag of frags) {
       const spans = tokenizer.spans(frag)
       const words = [...new Set(spans.map((x) => x.word))]
       if (words.length < 2) continue
       for (const w of words) store.node(w)
-      const r = store.graph.ingest(words, s)
+      // 每个词取第一次出现的位置，用于算词间距
+      const positions = new Map()
+      for (const sp of spans) if (!positions.has(sp.word)) positions.set(sp.word, { start: sp.start, end: sp.end })
+      const r = store.graph.ingest(words, s, { positions, text: frag })
       added += r.added
       hit += r.hit
+      if (r.pendingEdges) pendingEdges.push(...r.pendingEdges)
       for (const sp of spans) store.seedGloss(sp.word, frag, sp.start, sp.end)
     }
     if (added || hit) {
@@ -208,7 +215,7 @@ export function apply(ctx, config) {
       }
       store.dirty = true
     }
-    return { fragments: frags.length, added, hit }
+    return { fragments: frags.length, added, hit, pendingEdges }
   }
 
   async function ingestFile(filePath, s = 1) {
@@ -226,7 +233,9 @@ export function apply(ctx, config) {
       const words = [...new Set(spans.map((x) => x.word))]
       if (words.length < 2) continue
       for (const w of words) store.node(w)
-      const r = store.graph.ingest(words, s)
+      const positions = new Map()
+      for (const sp of spans) if (!positions.has(sp.word)) positions.set(sp.word, { start: sp.start, end: sp.end })
+      const r = store.graph.ingest(words, s, { positions, text: frag })
       added += r.added
       hit += r.hit
       for (const sp of spans) {
@@ -269,6 +278,14 @@ export function apply(ctx, config) {
           let changed = false
           for (const it of items) { store.setGloss(it.word, it.gloss); changed = true }
           for (const w of rejects) { store.reject(w); changed = true }
+          // 边解释
+          const edges = parseEdgeReply(text)
+          for (const e of edges) {
+            const key = e.a < e.b ? e.a + '\u0000' + e.b : e.b + '\u0000' + e.a
+            const edge = store.graph.edges.get(key)
+            if (edge) { edge.gloss = e.gloss; edge.glossKind = 'llm'; changed = true }
+          }
+          diag.lastParsedEdge = edges.length
           if (changed) {
             store.save().catch((e) => ctx.logger?.warn?.('[assoc-mem] 解释落盘失败：' + messageOf(e)))
             diag.lastParsedGloss = items.length
@@ -313,9 +330,13 @@ export function apply(ctx, config) {
           }
 
           const pending = store.pendingGloss()
+          store.graph.params.edgeMode = store.state.edgeMode || 'context'
           checkGlossCompliance(context)
           const glossHint = store.state.glossMode === 'llm'
             ? buildGlossInstruction(pending, glossState.strike)
+            : ''
+          const edgeHint = store.state.glossMode === 'llm' && store.graph.params.edgeMode === 'llm'
+            ? buildEdgeInstruction(store.pendingEdges || [])
             : ''
           if (pending.length) {
             glossState.askedRound = store.graph.round
@@ -323,7 +344,7 @@ export function apply(ctx, config) {
           }
           diag.glossStrike = glossState.strike
           const raw = buildInjection(store, tokenizer, userText)
-          const out = [glossHint, raw].filter(Boolean).join('\n\n')
+          const out = [glossHint, edgeHint, raw].filter(Boolean).join('\n\n')
           diag.pendingGloss = pending.length
           diag.lastInjectedLen = out.length
           diag.lastError = out ? 'ok' : 'empty-injection'
@@ -470,6 +491,21 @@ export function apply(ctx, config) {
       store.graph.params = next
       store.state.params = next
       await store.save()
+      sendJson(res, 200, store.snapshot())
+    } catch (e) { sendJson(res, 500, { error: messageOf(e) }) }
+  })
+
+  route('/edge-mode', async (req, res) => {
+    if (!guard(req, res, 'POST')) return
+    try {
+      await ready
+      const body = await readBody(req)
+      const m = String(body.mode || '')
+      if (m === 'off' || m === 'context' || m === 'llm') {
+        store.state.edgeMode = m
+        store.graph.params.edgeMode = m
+        await store.save()
+      }
       sendJson(res, 200, store.snapshot())
     } catch (e) { sendJson(res, 500, { error: messageOf(e) }) }
   })
