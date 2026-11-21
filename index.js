@@ -346,6 +346,8 @@ export function apply(ctx, config) {
       }
 
       diag.explainReplyLen = text.length
+      // 留一份原文样本，格式对不上时能直接看到模型到底回了什么
+      diag.explainSample = text.slice(0, 600)
 
       const parsed = parseExplainReply(text, { nouns, edges })
       diag.explainNouns = parsed.nouns.length
@@ -373,7 +375,19 @@ export function apply(ctx, config) {
       if (missedEdges.length) store.unmarkAsked([], missedEdges)
       diag.explainMissed = missedNouns.length + missedEdges.length
 
-      if (changed || missedNouns.length || missedEdges.length) await store.save()
+      // 只有真正拿到结果的条目才记冷却。
+      // 没拿到的那些已经被 unmark 放行，下一轮立刻重问。
+      const doneNouns = nouns.filter((n) => gotNouns.has(n))
+      const doneEdges = edges.filter((e) =>
+        gotEdges.has(e.a + '|' + e.b) || gotEdges.has(e.b + '|' + e.a))
+      if (doneNouns.length || doneEdges.length) {
+        store.markAsked(doneNouns, doneEdges, store.state.turnCount || 0)
+      }
+      diag.explainDone = doneNouns.length + doneEdges.length
+
+      if (changed || missedNouns.length || missedEdges.length || doneNouns.length || doneEdges.length) {
+        await store.save()
+      }
       diag.explainAt = new Date().toISOString()
       ok = true
     } catch (e) {
@@ -440,10 +454,10 @@ export function apply(ctx, config) {
           const freshEdges = store.freshEdges(edgeCandidates, round, GLOSS_COOLDOWN_TURNS)
 
           if (freshNouns.length || freshEdges.length) {
-            store.markAsked(freshNouns, freshEdges, round)
-            store.save().catch((e) =>
-              ctx.logger?.warn?.('[assoc-mem] 轮次落盘失败：' + messageOf(e)))
-            // 不阻塞本轮注入：后台跑，结果回来自己入库
+            // 不在这里 markAsked：要等请求真的有结果再记。
+            // 提前记的话，一次失败就把这些条目锁 10 轮，
+            // 表现就是「问过却永远没有解释」——这个坑已经踩过两次了。
+            // 不阻塞本轮注入：后台跑，结果回来自己入库、自己记冷却。
             void runExplainJob(freshNouns, freshEdges)
           }
 
