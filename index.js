@@ -34,7 +34,7 @@ import { Store } from './lib/store.js'
 import { Tokenizer } from './lib/tokenizer.js'
 import { buildInjection, previewLines } from './lib/retrieve.js'
 import { parseGlossReply, GLOSS_COOLDOWN_TURNS } from './lib/gloss.js'
-import { buildExplainRequest, parseExplainReply, collectStream, EXPLAIN_LIMITS } from './lib/explain.js'
+import { buildExplainRequest, parseExplainReply, collectStream } from './lib/explain.js'
 import { splitParagraphs, userFragment } from './lib/fragments.js'
 
 const BASE = '/dsh-assoc-mem'
@@ -344,7 +344,7 @@ export function apply(ctx, config) {
       // 之前有请求挂住不返回 finish，导致 running 永远为 true、
       // 后续每一轮都被 busy 挡掉，看起来就是「彻底不动了」。
       const ac = new AbortController()
-      const timer = setTimeout(() => { try { ac.abort() } catch { /* 已结束 */ } }, 60 * 1000)
+      const timer = setTimeout(() => { try { ac.abort() } catch { /* 已结束 */ } }, 120 * 1000)
       let text = ''
       let failure = null
       try {
@@ -354,7 +354,7 @@ export function apply(ctx, config) {
           system,
           messages: [{ role: 'user', content: [{ type: 'text', text: user }] }],
           temperature: 0,
-          maxTokens: 800,
+          maxTokens: Math.min(8000, 200 + (nouns.length + edges.length) * 40),
           signal: ac.signal,
         })
         // 硬超时：不指望 adapter 一定尊重 signal。
@@ -363,7 +363,7 @@ export function apply(ctx, config) {
         const r = await Promise.race([
           collectStream(stream),
           new Promise((resolve) => {
-            setTimeout(() => resolve({ text: '', failure: { message: 'stream-timeout' } }), 60 * 1000)
+            setTimeout(() => resolve({ text: '', failure: { message: 'stream-timeout' } }), 120 * 1000)
           }),
         ])
         text = r.text
