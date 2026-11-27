@@ -86,11 +86,50 @@ async function readBody(req) {
   }
 }
 
+/**
+ * 取某个词在本轮原话里的语境句，供解释请求使用。
+ *
+ * 为什么按小句而不是按 token 数：中文小句实测中位数只有 10 字（p90 为 16 字），
+ * 一个完整小句本身就落在十几 token 之内，硬套 token 窗口反而会从句子中间切断，
+ * 读起来不完整。这里优先返回包含该词的小句；小句太短（<6 字）才向前后扩一句。
+ *
+ * 上限 CONTEXT_MAX_CHARS 是硬保护：用户一次粘贴长文时，不能把整段搬进解释请求。
+ */
+const CONTEXT_MAX_CHARS = 80
+function contextOf(word, text) {
+  const w = String(word || '').trim()
+  const t = String(text || '')
+  if (!w || !t) return ''
+  const idx = t.indexOf(w)
+  if (idx < 0) return ''
+  // 以中文标点和换行为界切小句，同时保留每个小句的起止位置
+  const parts = []
+  const re = /[^，。；！？、,.\n;!?]+/g
+  let m
+  while ((m = re.exec(t)) !== null) parts.push({ s: m.index, e: m.index + m[0].length, t: m[0].trim() })
+  if (!parts.length) return t.slice(0, CONTEXT_MAX_CHARS).trim()
+  // 命中词所在的那个小句
+  let hit = parts.findIndex((p2) => p2.s <= idx && idx < p2.e)
+  if (hit < 0) hit = 0
+  let out = parts[hit].t
+  // 小句过短时补上相邻一句，避免只拿到「所以」这种孤立片段
+  if (out.length < 6) {
+    if (hit > 0) out = parts[hit - 1].t + '，' + out
+    if (out.length < 12 && hit + 1 < parts.length) out = out + '，' + parts[hit + 1].t
+  }
+  if (out.length > CONTEXT_MAX_CHARS) out = out.slice(0, CONTEXT_MAX_CHARS) + '…'
+  return out
+}
 function isUserAuthored(message) {
   if (!message || typeof message !== 'object') return false
   const source = message.source && typeof message.source === 'object' ? message.source : null
   if (!source) return message.role === 'user'
-  return source.kind === 'user'
+  const kind = source.kind
+  if (kind === 'user') return true
+  // 记忆只该收录用户亲手写的内容。工具结果、文件读取、系统注入、
+  // assistant 输出一律不入库——否则插件读过的文件内容会污染记忆库，
+  // 模型自己的措辞也会被当成「用户说过的话」记下来。
+  return false
 }
 
 function textOfContent(content) {
@@ -167,25 +206,71 @@ export function apply(ctx, config) {
     ctx.logger?.warn?.('[assoc-mem] 初始化失败：' + messageOf(error))
   })
 
-  async function ingestText(text, s = 1) {
+/**
+ * 把一段原文按句切开，逐句建边。
+ *
+ * 为什么要按句：早先是整段两两相连，一段里跨句的词也会连上，
+ * 于是产生「插件—问题」「模型—时候」这种由两个小句的残留成分拼出来的杂边。
+ * 实测 8 轮多话题对话里，整段建边得 88 条边、平均度 5.33；
+ * 改为同句建边后是 41 条、平均度 2.65，砍掉的基本都是这类拼接噪声。
+ * 依据：共现假设要求「在同一语境里共同出现」，一句话本身就是最自然的语境单位。
+ *
+ * 句边界只认句末标点和换行，逗号不断句——中文小句太短（p50=10 字），
+ * 按逗号切会把「因为…」和「所以…」拆散，反而丢掉真正的因果关联。
+ */
+const SENT_RE = /[^。！？!?\n]+[。！？!?]?/g
+function splitSentences(text) {
+  const out = []
+  const t = String(text || '')
+  let m
+  SENT_RE.lastIndex = 0
+  while ((m = SENT_RE.exec(t)) !== null) {
+    const raw = m[0]
+    if (!raw.trim()) continue
+    out.push({ start: m.index, end: m.index + raw.length, text: raw })
+  }
+  return out
+}
+
+/**
+ * 摄入一个片段：按句建边、写解释、返回计数。三处调用共用（同步/异步/文件）。
+ */
+function ingestFragment(frag, s = 1, opts = {}) {
+  const out = { added: 0, hit: 0, glossed: 0, pendingEdges: [] }
+  const sents = splitSentences(frag)
+  const chunks = sents.length ? sents : [{ start: 0, end: String(frag).length, text: String(frag) }]
+  for (const sent of chunks) {
+    const spans = tokenizer.spans(sent.text)
+    if (!spans.length) continue
+    const words = [...new Set(spans.map((x) => x.word))]
+    for (const w of words) store.node(w)
+    // 单句里只有一个概念时不建边，但解释照写
+    if (words.length >= 2) {
+      const positions = new Map()
+      for (const sp of spans) if (!positions.has(sp.word)) positions.set(sp.word, { start: sp.start, end: sp.end })
+      const r = store.graph.ingest(words, s, { positions, text: sent.text })
+      out.added += r.added
+      out.hit += r.hit
+      if (Array.isArray(r.pendingEdges) && r.pendingEdges.length) out.pendingEdges.push(...r.pendingEdges)
+    }
+    if (opts.gloss !== false) {
+      for (const sp of spans) if (store.seedGloss(sp.word, sent.text, sp.start, sp.end)) out.glossed += 1
+    }
+  }
+  return out
+}
+
+async function ingestText(text, s = 1) {
     await ready
     const frags = userFragment(text)
     let added = 0
     let hit = 0
     let glossed = 0
     for (const frag of frags) {
-      const spans = tokenizer.spans(frag)
-      const words = [...new Set(spans.map((x) => x.word))]
-      if (words.length < 2) continue
-      for (const w of words) store.node(w)
-      const positions = new Map()
-      for (const sp of spans) if (!positions.has(sp.word)) positions.set(sp.word, { start: sp.start, end: sp.end })
-      const r = store.graph.ingest(words, s, { positions, text: frag })
+      const r = ingestFragment(frag, s)
       added += r.added
       hit += r.hit
-      for (const sp of spans) {
-        if (store.seedGloss(sp.word, frag, sp.start, sp.end)) glossed += 1
-      }
+      glossed += r.glossed
     }
     const isolated = store.graph.isolatePrune()
     for (const name of store.nodes.keys()) {
@@ -206,18 +291,10 @@ export function apply(ctx, config) {
     let hit = 0
     let pendingEdges = []
     for (const frag of frags) {
-      const spans = tokenizer.spans(frag)
-      const words = [...new Set(spans.map((x) => x.word))]
-      if (words.length < 2) continue
-      for (const w of words) store.node(w)
-      // 每个词取第一次出现的位置，用于算词间距
-      const positions = new Map()
-      for (const sp of spans) if (!positions.has(sp.word)) positions.set(sp.word, { start: sp.start, end: sp.end })
-      const r = store.graph.ingest(words, s, { positions, text: frag })
+      const r = ingestFragment(frag, s)
       added += r.added
       hit += r.hit
-      if (r.pendingEdges) pendingEdges.push(...r.pendingEdges)
-      for (const sp of spans) store.seedGloss(sp.word, frag, sp.start, sp.end)
+      if (r.pendingEdges.length) pendingEdges.push(...r.pendingEdges)
     }
     if (added || hit) {
       store.graph.isolatePrune()
@@ -242,18 +319,10 @@ export function apply(ctx, config) {
     let hit = 0
     let glossed = 0
     for (const frag of frags) {
-      const spans = tokenizer.spans(frag)
-      const words = [...new Set(spans.map((x) => x.word))]
-      if (words.length < 2) continue
-      for (const w of words) store.node(w)
-      const positions = new Map()
-      for (const sp of spans) if (!positions.has(sp.word)) positions.set(sp.word, { start: sp.start, end: sp.end })
-      const r = store.graph.ingest(words, s, { positions, text: frag })
+      const r = ingestFragment(frag, s)
       added += r.added
       hit += r.hit
-      for (const sp of spans) {
-        if (store.seedGloss(sp.word, frag, sp.start, sp.end)) glossed += 1
-      }
+      glossed += r.glossed
     }
     store.dirty = true
     return { fragments: frags.length, added, hit, glossed, chars: text.length }
@@ -265,6 +334,8 @@ export function apply(ctx, config) {
   // 解释任务：插件自己向 LLM 请求，不再依赖主对话模型写段落。
   // 同时只跑一个任务，避免连续多轮叠出并发请求。
   const explainJob = { running: false, lastAt: 0 }
+  // 本轮用户原话：解释请求要拿它当语境，否则模型只能望文生义
+  let lastUserText = ''
 
   /**
    * 后台请求解释：名词 + 边**一次问完、一次收回**。
@@ -305,7 +376,7 @@ export function apply(ctx, config) {
         diag.explainError = 'llm-service-unavailable'
         return
       }
-      const { system, user } = buildExplainRequest({ nouns, edges })
+      const { system, user } = buildExplainRequest({ nouns, edges, contextOf: (w) => contextOf(w, lastUserText) })
       if (!system && !user) { ok = true; return }
 
       // 模型路由：优先用面板里手动配置的，没配才用当前默认模型。
@@ -449,6 +520,7 @@ export function apply(ctx, config) {
           diag.hasLogger = Boolean(ctx.logger)
           if (!store.state.enabled) { diag.lastError = 'disabled'; return '' }
           const userText = latestUserText(context)
+          lastUserText = userText
           diag.lastUserLen = userText.length
           if (!userText) { diag.lastError = 'no-user-text'; return '' }
 

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { MemoryGraph } from './lib/graph.js'
 import { Tokenizer } from './lib/tokenizer.js'
 import { splitParagraphs, userFragment, estimateTokens } from './lib/fragments.js'
+import { buildExplainRequest, parseExplainReply } from './lib/explain.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 let pass = 0
@@ -122,6 +123,25 @@ console.log('== 7. 孤立概念清理 ==')
   const before = g.edges.size
   const dropped = g.isolatePrune()
   check('孤立概念被清除', dropped >= 0 && g.edges.size <= before, 'dropped=' + dropped)
+}
+
+console.log('== 8. 解释请求模板 ==')
+{
+  const ctxOf = (w) => (w === '冷却' ? '另外冷却好像也有问题' : '')
+  const req = buildExplainRequest({ nouns: ['冷却', '任务'], edges: [{ a: '模型', b: '任务' }], contextOf: ctxOf })
+  check('每行给出 ____ 占位', req.user.split('\n').every((l) => l.includes('____')), req.user)
+  check('带语境的行附原话', req.user.includes('〔原话〕另外冷却好像也有问题'), req.user)
+  check('无语境的行不附原话', req.user.split('\n')[1] === '任务｜____', req.user.split('\n')[1])
+  check('词对行用半角竖线连接两词', req.user.includes('模型|任务｜____'))
+
+  const reply = ['冷却｜问过之后一段时间内不再重复', '任务｜这一轮要完成的改动', '模型|任务｜模型把任务理解错了'].join('\n')
+  const got = parseExplainReply(reply, { nouns: ['冷却', '任务'], edges: [{ a: '模型', b: '任务' }] })
+  check('解析出名词解释', got.nouns.length === 2, JSON.stringify(got.nouns))
+  check('解析出边解释', got.edges.length === 1 && got.edges[0].gloss.length > 0)
+
+  const blank = buildExplainRequest({ nouns: ['冷却'], edges: [], contextOf: ctxOf })
+  const un = parseExplainReply(blank.user, { nouns: ['冷却'], edges: [] })
+  check('占位符原样返回不入库', un.nouns.length === 0, JSON.stringify(un.nouns))
 }
 
 console.log('\n结果: ' + pass + ' 通过, ' + fail + ' 失败')
