@@ -138,9 +138,12 @@ console.log('== 8. 解释请求模板 ==')
 {
   const ctxOf = (w) => (w === '冷却' ? '另外冷却好像也有问题' : '')
   const req = buildExplainRequest({ nouns: ['冷却', '任务'], edges: [{ a: '模型', b: '任务' }], contextOf: ctxOf })
-  check('每行给出 ____ 占位', req.user.split('\n').every((l) => l.includes('____')), req.user)
+  // 现在的 user 带自描述外壳与 BEGIN/END 分隔，只校验有效行
+  const bodyLines = req.user.split('\n').filter((l) => l.includes('｜'))
+  check('每行给出 ____ 占位', bodyLines.length > 0 && bodyLines.every((l) => l.includes('____')), req.user)
   check('带语境的行附原话', req.user.includes('〔原话〕另外冷却好像也有问题'), req.user)
-  check('无语境的行不附原话', req.user.split('\n')[1] === '任务｜____', req.user.split('\n')[1])
+  const noCtx = req.user.split('\n').filter((l) => l.includes('｜'))[1]
+  check('无语境的行不附原话', noCtx === '任务｜____', noCtx)
   check('词对行用半角竖线连接两词', req.user.includes('模型|任务｜____'))
 
   const reply = ['冷却｜问过之后一段时间内不再重复', '任务｜这一轮要完成的改动', '模型|任务｜模型把任务理解错了'].join('\n')
@@ -243,8 +246,9 @@ console.log('== 13. 多边结构（团） ==')
   check('团的成员完整', r.pendingCliques[0].names.length === 3)
 
   const req = buildExplainRequest({ nouns: [], edges: [], cliques: r.pendingCliques })
-  check('团在请求里只占一行', req.user.split('\n').length === 1, req.user)
-  check('团用 | 连接三词', /\|/.test(req.user.split('｜')[0]), req.user)
+  check('团在请求里只占一行', req.user.split('\n').filter((l) => l.includes('｜')).length === 1, req.user)
+  const cliqueLine = req.user.split('\n').find((l) => l.includes('｜')) || ''
+  check('团用 | 连接三词', /\|/.test(cliqueLine.split('｜')[0]), cliqueLine)
 
   const parsed = parseExplainReply('牛顿|苹果|万有引力｜牛顿在苹果树下想到万有引力', { nouns: [], edges: [] })
   check('解析出团解释', parsed.cliques.length === 1, JSON.stringify(parsed.cliques))
@@ -327,6 +331,57 @@ console.log('== 16. 团压制单边（能成团就不建单边） ==')
   g3.ingest(words, 1, { positions, text })
   g3.dropNode('书店')
   check('删成员即拆团', g3.cliques.size === 0)
+}
+
+console.log('== 17. 元描述过滤 ==')
+{
+  const want = { nouns: ['概念', '逻辑'], edges: [] }
+  const meta = [
+    '概念｜多边 "书"+"店"+"知识"+"交易"',
+    '概念｜该词由书店、知识、交易三者组合',
+    '概念｜书店|知识|交易',
+  ]
+  for (const line of meta) {
+    check('丢弃元描述·' + line.slice(3, 10), parseExplainReply(line, want).nouns.length === 0, line)
+  }
+  check('保留真解释', parseExplainReply('概念｜对一类事物的抽象概括', want).nouns.length === 1)
+  check('保留抽象词说明', parseExplainReply('逻辑｜推理过程应遵循的规律', want).nouns.length === 1)
+
+  const st = new Store({})
+  st.node('概念').gloss.push({ text: '多边 "书"+"店"', t: 1, kind: 'manual' })
+  st.node('逻辑').gloss.push({ text: '推理应遵循的规律', t: 1, kind: 'context' })
+  const cleared = st.purgeMetaGlosses()
+  check('purge 清掉元描述', cleared === 1, 'cleared=' + cleared)
+  check('purge 保留正常解释', st.nodes.get('逻辑').gloss.length === 1)
+  check('清空后重新入队', st.nodes.get('概念').gloss.length === 0)
+}
+
+console.log('== 18. 解释长度与截断 ==')
+{
+  const want = { nouns: ['元素'], edges: [] }
+  // 短解释原样保留
+  const short = parseExplainReply('元素｜对一类事物的抽象概括', want)
+  check('短解释不截断', short.nouns[0].gloss === '对一类事物的抽象概括', short.nouns[0].gloss)
+
+  // 中等长度（旧上限 20 会砍断）现在完整保留
+  const mid = '元素一词本身是对多边结构中各个组成成分的统称，这里用来泛指参与组合的名词性概念'
+  const midGot = parseExplainReply('元素｜' + mid, want)
+  check('40+ 字解释完整保留', midGot.nouns[0].gloss === mid, midGot.nouns[0].gloss.length + '字')
+
+  // 超长按标点收口，不切在字中间
+  const veryLong = mid + '，包括但不限于实体、属性、关系等各类抽象范畴，以及它们的组合方式'
+  const longGot = parseExplainReply('元素｜' + veryLong, want)
+  const g = longGot.nouns[0].gloss
+  check('超长按标点收口', /[。！？，、；：…]$/.test(g), g)
+  check('收口后长度受控', g.length <= 61, g.length + '字')
+
+  // 旧版硬切残句应被清扫
+  const st = new Store({})
+  st.node('残句').gloss.push({ text: '多边 "元素"一词本身就是对多边结构中各', t: 1, kind: 'llm' })
+  st.node('正常').gloss.push({ text: '推理过程应遵循的规律', t: 1, kind: 'llm' })
+  const cleared = st.purgeMetaGlosses()
+  check('清扫旧截断残句', cleared === 1 && st.nodes.get('残句').gloss.length === 0, 'cleared=' + cleared)
+  check('正常解释不受影响', st.nodes.get('正常').gloss.length === 1)
 }
 
 console.log('\n结果: ' + pass + ' 通过, ' + fail + ' 失败')

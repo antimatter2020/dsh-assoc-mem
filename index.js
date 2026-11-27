@@ -200,6 +200,22 @@ export function apply(ctx, config) {
     await store.init()
     // 恢复对话轮次计数：必须在 init 之后，因为要从记忆文件里读
     turn.n = Number.isFinite(store.state.turnCount) ? store.state.turnCount : 0
+    // 启动即做一次一致性清理：
+    //  - 团成员之间的残留二元边（旧版本按二元建出来的）
+    //  - 模型曾经写成「多边 "a"+"b"」这类元描述的解释
+    // 这两件事早先只在新摄入时顺带发生，老记忆库会一直保留错误状态。
+    try {
+      const removedEdges = store.graph.syncCliqueEdges ? store.graph.syncCliqueEdges() : 0
+      const purged = store.purgeMetaGlosses ? store.purgeMetaGlosses() : 0
+      if (removedEdges || purged) {
+        store.dirty = true
+        // 必须落盘，否则下次启动又回到错误状态
+        await store.save().catch(() => {})
+        ctx.logger?.info?.('[assoc-mem] 启动清理：团内边 ' + removedEdges + '，元描述解释 ' + purged)
+      }
+    } catch (e) {
+      ctx.logger?.warn?.('[assoc-mem] 启动清理失败：' + messageOf(e))
+    }
     tokenizer.extraWords = new Set(store.custom)
     tokenizer.blocked = new Set(store.blocked)
     tokenizer.customConcepts = new Set(store.custom)
@@ -704,6 +720,17 @@ async function ingestText(text, s = 1) {
       const n = store.clearPendingGloss()
       await store.save()
       sendJson(res, 200, { cleared: n, remaining: store.pendingGloss().length })
+    } catch (e) { sendJson(res, 500, { error: messageOf(e) }) }
+  })
+
+  // 清掉模型写成「多边 "a"+"b"」这类元描述的解释，让这些词重新入队。
+  route('/gloss-purge-meta', async (req, res) => {
+    if (!guard(req, res, 'POST')) return
+    try {
+      await ready
+      const cleared = store.purgeMetaGlosses()
+      if (cleared) await store.save()
+      sendJson(res, 200, { cleared, remaining: store.pendingGloss().length })
     } catch (e) { sendJson(res, 500, { error: messageOf(e) }) }
   })
 
