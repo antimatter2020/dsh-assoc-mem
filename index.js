@@ -213,7 +213,7 @@ export function apply(ctx, config) {
  * 摄入一个片段：按句建边、写解释、返回计数。三处调用共用（同步/异步/文件）。
  */
 function ingestFragment(frag, s = 1, opts = {}) {
-  const out = { added: 0, hit: 0, glossed: 0, pendingEdges: [] }
+  const out = { added: 0, hit: 0, glossed: 0, pendingEdges: [], pendingCliques: [] }
   const sents = splitSentences(frag)
   const chunks = sents.length ? sents : [{ start: 0, end: String(frag).length, text: String(frag) }]
   for (const sent of chunks) {
@@ -229,6 +229,7 @@ function ingestFragment(frag, s = 1, opts = {}) {
       out.added += r.added
       out.hit += r.hit
       if (Array.isArray(r.pendingEdges) && r.pendingEdges.length) out.pendingEdges.push(...r.pendingEdges)
+      if (Array.isArray(r.pendingCliques) && r.pendingCliques.length) out.pendingCliques.push(...r.pendingCliques)
     }
     if (opts.gloss !== false) {
       for (const sp of spans) if (store.seedGloss(sp.word, sent.text, sp.start, sp.end)) out.glossed += 1
@@ -267,11 +268,13 @@ async function ingestText(text, s = 1) {
     let added = 0
     let hit = 0
     let pendingEdges = []
+    let pendingCliques = []
     for (const frag of frags) {
       const r = ingestFragment(frag, s)
       added += r.added
       hit += r.hit
       if (r.pendingEdges.length) pendingEdges.push(...r.pendingEdges)
+      if (r.pendingCliques.length) pendingCliques.push(...r.pendingCliques)
     }
     if (added || hit) {
       store.graph.isolatePrune()
@@ -282,7 +285,8 @@ async function ingestText(text, s = 1) {
     }
     // 挂到 store 上，注入段落才拿得到「本轮新增、还没解释的边」。
     store.pendingEdges = pendingEdges
-    return { fragments: frags.length, added, hit, pendingEdges }
+    store.pendingCliques = pendingCliques
+    return { fragments: frags.length, added, hit, pendingEdges, pendingCliques }
   }
 
   async function ingestFile(filePath, s = 1) {
@@ -321,7 +325,7 @@ async function ingestText(text, s = 1) {
    * 「补充解释：」「关系解释：」，但它经常漏写关系段，插件只能干等。
    * 现在改成插件自己调 ctx.llm.stream()，模型没有「不写」的余地。
    */
-  async function runExplainJob(nouns, edges) {
+  async function runExplainJob(nouns, edges, cliques = []) {
     await ready
     // 卡死保护：流如果不返回 finish，running 会永远是 true，
     // 之后每一轮都被 busy 挡掉（实测踩过）。超过 90 秒一律当它死了。
@@ -353,7 +357,7 @@ async function ingestText(text, s = 1) {
         diag.explainError = 'llm-service-unavailable'
         return
       }
-      const { system, user } = buildExplainRequest({ nouns, edges, contextOf: (w) => contextOf(w, lastUserText) })
+      const { system, user } = buildExplainRequest({ nouns, edges, cliques, contextOf: (w) => contextOf(w, lastUserText) })
       if (!system && !user) { ok = true; return }
 
       // 模型路由：优先用面板里手动配置的，没配才用当前默认模型。
@@ -444,6 +448,12 @@ async function ingestText(text, s = 1) {
         const key = e.a < e.b ? e.a + '\u0000' + e.b : e.b + '\u0000' + e.a
         const edge = store.graph.edges.get(key)
         if (edge) { edge.gloss = e.gloss; edge.glossKind = 'llm'; changed = true }
+      }
+      // 团解释：整体存一条，按排序后的词名当 key
+      for (const c of parsed.cliques) {
+        const names = [...c.names].sort()
+        const cq = store.graph.cliques.get(names.join('\u0000'))
+        if (cq) { cq.gloss = c.gloss; cq.glossKind = 'llm'; changed = true }
       }
 
       // 没拿到的条目解除冷却，下一轮立刻能再问——
@@ -547,13 +557,23 @@ async function ingestText(text, s = 1) {
           const edgeCandidates = store.state.glossMode === 'llm' &&
             store.graph.params.edgeMode === 'llm' &&
             Array.isArray(store.pendingEdges) ? store.pendingEdges : []
+          // 多边结构（同句 >=3 个概念）单独排队
+          const cliqueCandidates = store.state.glossMode === 'llm' &&
+            store.graph.params.edgeMode === 'llm' &&
+            Array.isArray(store.pendingCliques) ? store.pendingCliques : []
 
           // 逐条冷却：前 GLOSS_COOLDOWN_TURNS 轮内问过的那一条跳过，不影响其它条目
           const round = turn.n
           const freshNouns = store.freshNouns(nounCandidates, round, GLOSS_COOLDOWN_TURNS)
           const freshEdges = store.freshEdges(edgeCandidates, round, GLOSS_COOLDOWN_TURNS)
 
-          if (freshNouns.length || freshEdges.length) {
+          // 团的冷却同样按 key 判断，复用 freshEdges 的键格式
+          const freshCliques = store.freshEdges(
+            cliqueCandidates.map((c) => ({ a: c.names.join('\u0001'), b: '' })),
+            round, GLOSS_COOLDOWN_TURNS,
+          ).map((x) => ({ names: x.a.split('\u0001') }))
+
+          if (freshNouns.length || freshEdges.length || freshCliques.length) {
             // 不在这里 markAsked：要等请求真的有结果再记。
             // 提前记的话，一次失败就把这些条目锁 10 轮，
             // 表现就是「问过却永远没有解释」——这个坑已经踩过两次了。
@@ -562,7 +582,7 @@ async function ingestText(text, s = 1) {
             // 这里必须按轮次去重，否则第二次就撞上 busy 白白跳过。
             if (explainJob.lastRound !== round) {
               explainJob.lastRound = round
-              void runExplainJob(freshNouns, freshEdges)
+              void runExplainJob(freshNouns, freshEdges, freshCliques)
             }
           }
 

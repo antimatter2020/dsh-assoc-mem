@@ -11,6 +11,7 @@ import { buildExplainRequest, parseExplainReply } from './lib/explain.js'
 import { splitSentences, sentenceAt } from './lib/sentence.js'
 import { Store } from './lib/store.js'
 import { detectSurprise, surpriseToSalience, SURPRISE_THRESHOLD } from './lib/surprise.js'
+import { scoreSentence, SENTENCE_QUALITY_MIN } from './lib/quality.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 let pass = 0
@@ -209,6 +210,82 @@ console.log('== 11. 惊讶硬判定（闪光灯效应触发） ==')
   check('惊讶升到 2 档', surpriseToSalience(4) === 2, String(surpriseToSalience(4)))
   check('强烈惊讶升到 3 档', surpriseToSalience(SURPRISE_THRESHOLD + 3) === 3)
   check('未达阈值保持 1 档', surpriseToSalience(0) === 1)
+}
+
+console.log('== 12. 解释冷却（10 轮内不重复请求） ==')
+{
+  const st = new Store({})
+  st.state.glossMode = 'llm'
+  st.markAsked(['牛顿'], [], 5)
+  check('5 轮内被冷却', st.freshNouns(['牛顿'], 6, 10).length === 0)
+  check('刚好到 10 轮仍冷却', st.freshNouns(['牛顿'], 15, 10).length === 0)
+  check('超过 10 轮放行', st.freshNouns(['牛顿'], 16, 10).length === 1)
+  check('其它词不受影响', st.freshNouns(['苹果'], 6, 10).length === 1)
+  st.unmarkAsked(['牛顿'], [])
+  check('解除冷却后立即放行', st.freshNouns(['牛顿'], 6, 10).length === 1)
+}
+
+console.log('== 13. 多边结构（团） ==')
+{
+  const g = new MemoryGraph({ edgeMode: 'llm' })
+  const text = '牛顿研究苹果万有引力'
+  const words = ['牛顿', '苹果', '万有引力']
+  const positions = new Map()
+  for (const w of words) { const i = text.indexOf(w); positions.set(w, { start: i, end: i + w.length }) }
+  const r = g.ingest(words, 1, { positions, text })
+  check('同句 >=3 词登记为团', g.cliques.size === 1, String(g.cliques.size))
+  check('团有待解释记录', r.pendingCliques.length === 1)
+  check('团的成员完整', r.pendingCliques[0].names.length === 3)
+
+  const req = buildExplainRequest({ nouns: [], edges: [], cliques: r.pendingCliques })
+  check('团在请求里只占一行', req.user.split('\n').length === 1, req.user)
+  check('团用 | 连接三词', /\|/.test(req.user.split('｜')[0]), req.user)
+
+  const parsed = parseExplainReply('牛顿|苹果|万有引力｜牛顿在苹果树下想到万有引力', { nouns: [], edges: [] })
+  check('解析出团解释', parsed.cliques.length === 1, JSON.stringify(parsed.cliques))
+  check('团名已排序', parsed.cliques[0].names.join(',') === [...parsed.cliques[0].names].sort().join(','))
+
+  // 与单边不冲突：AB 单边仍可单独存在
+  const g2 = new MemoryGraph({ edgeMode: 'llm' })
+  const t2 = '牛顿苹果'
+  const p2 = new Map([['牛顿', { start: 0, end: 2 }], ['苹果', { start: 2, end: 4 }]])
+  g2.ingest(['牛顿', '苹果'], 1, { positions: p2, text: t2 })
+  check('两个词不构成团', g2.cliques.size === 0)
+  check('两个词仍建二元边', g2.edges.size === 1)
+}
+
+console.log('== 14. 句子质量与替换 ==')
+{
+  check('定义句判为好', scoreSentence('牛顿是提出经典力学的物理学家', '牛顿').poor === false)
+  check('语气词判为差', scoreSentence('好的吧', '好').poor === true)
+  check('指代开头判为差', scoreSentence('然后再看一下', '看').poor === true)
+  check('不含该词判为差', scoreSentence('我们明天再说别的', '牛顿').poor === true)
+
+  const st = new Store({})
+  st.seedGloss('冷却', '好的吧。', 0, 2)
+  const first = st.nodes.get('冷却').gloss[0]
+  check('差句先存但标记 poor', first.poor === true)
+
+  st.seedGloss('冷却', '冷却是指问过之后一段时间内不再重复询问。', 0, 2)
+  const second = st.nodes.get('冷却').gloss[0]
+  check('好句替换掉差句', second.poor === false && second.text.includes('重复询问'), second.text)
+
+  st.seedGloss('冷却', '那就这样吧。', 0, 2)
+  const third = st.nodes.get('冷却').gloss[0]
+  check('差句顶不掉好句', third.text === second.text, third.text)
+}
+
+console.log('== 15. 非名词驳回 ==')
+{
+  const st = new Store({})
+  st.state.glossMode = 'llm'
+  st.node('逻辑')
+  st.node('所以')
+  check('驳回前在待解释队列', st.pendingGloss().includes('所以'))
+  st.reject('所以')
+  check('驳回后移出队列', !st.pendingGloss().includes('所以'))
+  check('驳回后进入屏蔽表', st.blocked.has('所以'))
+  check('其它名词不受影响', st.pendingGloss().includes('逻辑'))
 }
 
 console.log('\n结果: ' + pass + ' 通过, ' + fail + ' 失败')

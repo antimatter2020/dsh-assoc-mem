@@ -30,6 +30,7 @@
     "README.md",
     "lib/sentence.js",
     "lib/surprise.js",
+    "lib/quality.js",
     "lib/graph.js",
     "lib/tokenizer.js",
     "lib/store.js",
