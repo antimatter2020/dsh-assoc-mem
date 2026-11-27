@@ -10,6 +10,7 @@ import { splitParagraphs, userFragment, estimateTokens } from './lib/fragments.j
 import { buildExplainRequest, parseExplainReply } from './lib/explain.js'
 import { splitSentences, sentenceAt } from './lib/sentence.js'
 import { Store } from './lib/store.js'
+import { detectSurprise, surpriseToSalience, SURPRISE_THRESHOLD } from './lib/surprise.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 let pass = 0
@@ -180,6 +181,34 @@ console.log('== 10. 解释按整句储存 ==')
   g.ingest(words, 1, { positions, text })
   const edge = [...g.edges.values()][0]
   check('边解释存整句', edge.gloss.endsWith('。') && !edge.gloss.includes('…'), edge.gloss)
+}
+
+console.log('== 11. 惊讶硬判定（闪光灯效应触发） ==')
+{
+  const pos = [
+    '没想到这个 bug 居然是初始化顺序的问题。',
+    '这个函数竟然在构造完成前就被调用了。',
+    '好家伙，内存直接泄漏了两个 G。',
+    '两处配置完全一致，结果却不一样，难以置信。',
+    '等等，这里为什么会有两个初始化？',
+  ]
+  for (const t of pos) check('惊讶·' + t.slice(0, 8), detectSurprise(t).surprised === true)
+
+  const neg = [
+    '这个结果并不意外，之前就推断过。',
+    '这个报错没什么好惊讶的，很常见。',
+    '这个性能问题谈不上震惊，属于预期内。',
+    '我不觉得意外，逻辑上必然如此。',
+    '真的吗？你再确认一下。',
+    '报错如下：\n```\n竟然 undefined\n```\n这是第三方库的问题。',
+    '文档里写的是「出乎意料」，但我们这里很平稳。',
+    '我把它改成了同步调用，问题解决了。',
+  ]
+  for (const t of neg) check('非惊讶·' + t.slice(0, 8), detectSurprise(t).surprised === false)
+
+  check('惊讶升到 2 档', surpriseToSalience(4) === 2, String(surpriseToSalience(4)))
+  check('强烈惊讶升到 3 档', surpriseToSalience(SURPRISE_THRESHOLD + 3) === 3)
+  check('未达阈值保持 1 档', surpriseToSalience(0) === 1)
 }
 
 console.log('\n结果: ' + pass + ' 通过, ' + fail + ' 失败')

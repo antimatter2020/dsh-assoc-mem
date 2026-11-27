@@ -511,7 +511,24 @@ async function ingestText(text, s = 1) {
             // 轮次计数跨重启延续，否则旧记录会误判成「刚催过」
             store.state.turnCount = turn.n
             try {
-              const r = ingestSync(userText, 1)
+              // 闪光灯效应：把上一轮 AI 输出里的惊讶转成重要性档位。
+              // 为什么只能看「上一轮」：插件只有 section 这一个钩子，它在模型回复**之前**
+              // 运行，当轮拿不到本轮回复。所以这里取最近一条 assistant 文本，
+              // 用它的惊讶程度决定本轮片段建边时的 s。
+              let salience = 1
+              if (store.state.surpriseBoost) {
+                try {
+                  const aiText = latestAssistantText(context)
+                  const sp = detectSurprise(aiText)
+                  diag.surpriseScore = sp.score
+                  diag.surpriseHit = sp.hits.map((h) => h.cue).join(',')
+                  salience = surpriseToSalience(sp.score)
+                } catch (e) {
+                  diag.surpriseError = messageOf(e)
+                }
+              }
+              diag.salience = salience
+              const r = ingestSync(userText, salience)
               diag.lastIngest = r
               if (r.added || r.hit) {
                 store.save().catch((e) => ctx.logger?.warn?.('[assoc-mem] 落盘失败：' + messageOf(e)))
@@ -662,6 +679,19 @@ async function ingestText(text, s = 1) {
 
   // 整句截取上线后：把旧的半句解释清掉，让它们按新规则重新截取。
   // 只清 context 来源，手动/模型生成的解释不动。
+  // 闪光灯效应开关：开启后，AI 输出里检测到惊讶会把片段升到 2/3 档重要性。
+  route('/surprise-boost', async (req, res) => {
+    if (!guard(req, res, 'POST')) return
+    try {
+      await ready
+      const body = await readBody(req)
+      if (typeof body.enabled === 'boolean') store.state.surpriseBoost = body.enabled
+      store.dirty = true
+      await store.save()
+      sendJson(res, 200, { surpriseBoost: Boolean(store.state.surpriseBoost) })
+    } catch (e) { sendJson(res, 500, { error: messageOf(e) }) }
+  })
+
   route('/gloss-reset', async (req, res) => {
     if (!guard(req, res, 'POST')) return
     try {

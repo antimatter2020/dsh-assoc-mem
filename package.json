@@ -29,6 +29,7 @@
     "icon.svg",
     "README.md",
     "lib/sentence.js",
+    "lib/surprise.js",
     "lib/graph.js",
     "lib/tokenizer.js",
     "lib/store.js",
