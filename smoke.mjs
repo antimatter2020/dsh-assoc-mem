@@ -8,6 +8,8 @@ import { MemoryGraph } from './lib/graph.js'
 import { Tokenizer } from './lib/tokenizer.js'
 import { splitParagraphs, userFragment, estimateTokens } from './lib/fragments.js'
 import { buildExplainRequest, parseExplainReply } from './lib/explain.js'
+import { splitSentences, sentenceAt } from './lib/sentence.js'
+import { Store } from './lib/store.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 let pass = 0
@@ -142,6 +144,42 @@ console.log('== 8. 解释请求模板 ==')
   const blank = buildExplainRequest({ nouns: ['冷却'], edges: [], contextOf: ctxOf })
   const un = parseExplainReply(blank.user, { nouns: ['冷却'], edges: [] })
   check('占位符原样返回不入库', un.nouns.length === 0, JSON.stringify(un.nouns))
+}
+
+console.log('== 9. 切句规则 ==')
+{
+  const strong = splitSentences('我今天去学校。然后买东西！晚上回家了？')
+  check('句末标点切开', strong.length === 3, JSON.stringify(strong.map(s=>s.text)))
+  check('分号也是句末', splitSentences('第一件事做完；第二件事还没开始。').length === 2)
+  check('省略号是句末', splitSentences('我想想……算了不去了。').length === 2)
+  check('换行是句末', splitSentences('第一行\n第二行').length === 2)
+
+  const spaced = splitSentences('我今天去学校 然后买东西 晚上回家')
+  check('无标点按空格断句', spaced.length === 3, JSON.stringify(spaced.map(s=>s.text)))
+
+  const longComma = '我想把这个插件的解释请求重写一下，现在模型总是把任务理解错，返回的格式也不对，得改成逐行填空的形式，另外冷却好像也有问题，有时候一个词问过之后就再也不问了'
+  check('只有逗号且过长时按逗号切', splitSentences(longComma).length > 1)
+  check('只有逗号但句子短则不切', splitSentences('好的，我这就去改').length === 1)
+  check('英文句点不切断文件名', splitSentences('看下 README.md 和 v0.1.0 这两个文件。').length === 1)
+}
+
+console.log('== 10. 解释按整句储存 ==')
+{
+  const text = '我想把这东西重写一下，现在模型总是理解错。另外冷却好像也有问题，有时候一个词问过就再也不问了。'
+  const st = new Store({})
+  const i = text.indexOf('冷却')
+  st.seedGloss('冷却', text, i, i + 2)
+  const saved = st.nodes.get('冷却').gloss[0].text
+  check('名词解释存整句', saved === '另外冷却好像也有问题，有时候一个词问过就再也不问了。', saved)
+  check('名词解释未截断', !saved.includes('…'), saved)
+
+  const g = new MemoryGraph({ edgeMode: 'context' })
+  const words = ['冷却', '问题']
+  const positions = new Map()
+  for (const w of words) { const k = text.indexOf(w); positions.set(w, { start: k, end: k + w.length }) }
+  g.ingest(words, 1, { positions, text })
+  const edge = [...g.edges.values()][0]
+  check('边解释存整句', edge.gloss.endsWith('。') && !edge.gloss.includes('…'), edge.gloss)
 }
 
 console.log('\n结果: ' + pass + ' 通过, ' + fail + ' 失败')

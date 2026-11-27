@@ -393,7 +393,7 @@ window.__ModuleLoader__.load({
               onClick: () => onGlossMode('context', state.glossContextTokens || 30),
             },
               h('b', null, '上下文截取（默认·零消耗）'),
-              h('span', null, '取首次出现前后 ' + (state.glossContextTokens || 30) + ' token')),
+              h('span', null, '取该词首次出现所在的整句')),
             h('button', {
               'data-active': state.glossMode === 'llm' ? 'true' : 'false',
               onClick: () => onGlossMode('llm', state.glossContextTokens || 30),
@@ -414,7 +414,7 @@ window.__ModuleLoader__.load({
               onClick: () => onEdgeMode('context'),
             },
               h('b', null, '上下文截取'),
-              h('span', null, '20 token 内的原文')),
+              h('span', null, '该词所在的整句原文')),
             h('button', {
               'data-active': state.edgeMode === 'llm' ? 'true' : 'false',
               onClick: () => onEdgeMode('llm'),

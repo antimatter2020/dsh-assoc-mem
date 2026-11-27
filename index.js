@@ -36,6 +36,7 @@ import { buildInjection, previewLines } from './lib/retrieve.js'
 import { parseGlossReply, GLOSS_COOLDOWN_TURNS } from './lib/gloss.js'
 import { buildExplainRequest, parseExplainReply, collectStream } from './lib/explain.js'
 import { splitParagraphs, userFragment } from './lib/fragments.js'
+import { splitSentences, sentenceAt } from './lib/sentence.js'
 
 const BASE = '/dsh-assoc-mem'
 const SECTION_NAME = 'assoc-mem'
@@ -89,11 +90,12 @@ async function readBody(req) {
 /**
  * 取某个词在本轮原话里的语境句，供解释请求使用。
  *
- * 为什么按小句而不是按 token 数：中文小句实测中位数只有 10 字（p90 为 16 字），
- * 一个完整小句本身就落在十几 token 之内，硬套 token 窗口反而会从句子中间切断，
- * 读起来不完整。这里优先返回包含该词的小句；小句太短（<6 字）才向前后扩一句。
+ * 切句规则统一由 lib/sentence.js 提供（建边、语境、名词解释共用一套），
+ * 覆盖：句末标点（。！？；…）、无标点靠空格断句、只有逗号又过长时按逗号切。
  *
- * 上限 CONTEXT_MAX_CHARS 是硬保护：用户一次粘贴长文时，不能把整段搬进解释请求。
+ * 挑句逻辑：先取包含该词的那一句；句子太短（<6 字）就把前后邻句一起带上，
+ * 避免只拿到「所以」这种孤立片段。CONTEXT_MAX_CHARS 是硬保护，
+ * 用户粘贴长文时不能把整段搬进解释请求。
  */
 const CONTEXT_MAX_CHARS = 80
 function contextOf(word, text) {
@@ -102,24 +104,25 @@ function contextOf(word, text) {
   if (!w || !t) return ''
   const idx = t.indexOf(w)
   if (idx < 0) return ''
-  // 以中文标点和换行为界切小句，同时保留每个小句的起止位置
-  const parts = []
-  const re = /[^，。；！？、,.\n;!?]+/g
-  let m
-  while ((m = re.exec(t)) !== null) parts.push({ s: m.index, e: m.index + m[0].length, t: m[0].trim() })
-  if (!parts.length) return t.slice(0, CONTEXT_MAX_CHARS).trim()
-  // 命中词所在的那个小句
-  let hit = parts.findIndex((p2) => p2.s <= idx && idx < p2.e)
+  const parts = splitSentences(t)
+  if (!parts.length) return t.slice(Math.max(0, idx - 40), idx + 40).trim()
+  let hit = parts.findIndex((p2) => p2.start <= idx && idx < p2.end)
   if (hit < 0) hit = 0
-  let out = parts[hit].t
-  // 小句过短时补上相邻一句，避免只拿到「所以」这种孤立片段
-  if (out.length < 6) {
-    if (hit > 0) out = parts[hit - 1].t + '，' + out
-    if (out.length < 12 && hit + 1 < parts.length) out = out + '，' + parts[hit + 1].t
+  let lo = hit
+  let hi = hit
+  // 太短就向两侧扩，直到够长或到头——必须带上命中句本身，不能只拼邻句
+  while (parts[hi].end - parts[lo].start < 24 && (lo > 0 || hi < parts.length - 1)) {
+    if (hi < parts.length - 1) hi += 1
+    else if (lo > 0) lo -= 1
+    if (parts[hi].end - parts[lo].start >= 24) break
+    if (lo > 0) lo -= 1
   }
+  let out = t.slice(parts[lo].start, parts[hi].end).trim()
+  if (!out) out = t.slice(Math.max(0, idx - 40), idx + 40).trim()
   if (out.length > CONTEXT_MAX_CHARS) out = out.slice(0, CONTEXT_MAX_CHARS) + '…'
   return out
 }
+
 function isUserAuthored(message) {
   if (!message || typeof message !== 'object') return false
   const source = message.source && typeof message.source === 'object' ? message.source : null
@@ -205,32 +208,6 @@ export function apply(ctx, config) {
   })().catch((error) => {
     ctx.logger?.warn?.('[assoc-mem] 初始化失败：' + messageOf(error))
   })
-
-/**
- * 把一段原文按句切开，逐句建边。
- *
- * 为什么要按句：早先是整段两两相连，一段里跨句的词也会连上，
- * 于是产生「插件—问题」「模型—时候」这种由两个小句的残留成分拼出来的杂边。
- * 实测 8 轮多话题对话里，整段建边得 88 条边、平均度 5.33；
- * 改为同句建边后是 41 条、平均度 2.65，砍掉的基本都是这类拼接噪声。
- * 依据：共现假设要求「在同一语境里共同出现」，一句话本身就是最自然的语境单位。
- *
- * 句边界只认句末标点和换行，逗号不断句——中文小句太短（p50=10 字），
- * 按逗号切会把「因为…」和「所以…」拆散，反而丢掉真正的因果关联。
- */
-const SENT_RE = /[^。！？!?\n]+[。！？!?]?/g
-function splitSentences(text) {
-  const out = []
-  const t = String(text || '')
-  let m
-  SENT_RE.lastIndex = 0
-  while ((m = SENT_RE.exec(t)) !== null) {
-    const raw = m[0]
-    if (!raw.trim()) continue
-    out.push({ start: m.index, end: m.index + raw.length, text: raw })
-  }
-  return out
-}
 
 /**
  * 摄入一个片段：按句建边、写解释、返回计数。三处调用共用（同步/异步/文件）。
@@ -680,6 +657,18 @@ async function ingestText(text, s = 1) {
       const n = store.clearPendingGloss()
       await store.save()
       sendJson(res, 200, { cleared: n, remaining: store.pendingGloss().length })
+    } catch (e) { sendJson(res, 500, { error: messageOf(e) }) }
+  })
+
+  // 整句截取上线后：把旧的半句解释清掉，让它们按新规则重新截取。
+  // 只清 context 来源，手动/模型生成的解释不动。
+  route('/gloss-reset', async (req, res) => {
+    if (!guard(req, res, 'POST')) return
+    try {
+      await ready
+      const r = store.resetContextGloss()
+      await store.save()
+      sendJson(res, 200, { clearedGlosses: r.glosses, clearedEdges: r.edges })
     } catch (e) { sendJson(res, 500, { error: messageOf(e) }) }
   })
 

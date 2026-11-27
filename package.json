@@ -28,6 +28,7 @@
     "cordis.patch.yml",
     "icon.svg",
     "README.md",
+    "lib/sentence.js",
     "lib/graph.js",
     "lib/tokenizer.js",
     "lib/store.js",
