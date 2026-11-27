@@ -22,23 +22,28 @@ function check(name, cond, extra = '') {
   else { fail += 1; console.log('  FAIL ' + name + (extra ? ' — ' + extra : '')) }
 }
 
-console.log('== 1. 图更新 ==')
+console.log('== 1. 图更新（单边：恰好两个概念） ==')
 {
+  // 二元边只在本句恰好 2 个概念时建立；>=3 个归团，见第 13 组。
   const g = new MemoryGraph({ i: 0.005, x: 0.03, y: 0.06, w0: 0.05, thr: 0.05, wmax: 0.9 })
-  const r1 = g.ingest(['牛顿', '苹果', '莱布尼茨'], 1)
-  check('首轮建 3 条边', r1.added === 3, 'got ' + r1.added)
+  const r1 = g.ingest(['牛顿', '苹果'], 1)
+  check('两词建 1 条边', r1.added === 1, 'got ' + r1.added)
   check('首轮命中 0', r1.hit === 0)
 
   const wAB = g.neighbours('牛顿', 99).find((n) => n.name === '苹果')
   check('牛顿-苹果 过线', Boolean(wAB), 'w=' + (wAB && wAB.w))
 
-  const r2 = g.ingest(['牛顿', '莱布尼茨', '爱因斯坦'], 1)
-  check('第二轮命中 1 (牛顿-莱布尼茨)', r2.hit === 1, 'got ' + r2.hit)
-  check('第二轮新增 2 条', r2.added === 2, 'got ' + r2.added)
+  // 同一对再出现一次 = 命中加强
+  const r2 = g.ingest(['牛顿', '苹果'], 1)
+  check('第二轮命中 1', r2.hit === 1, 'got ' + r2.hit)
+  check('第二轮不新增边', r2.added === 0, 'got ' + r2.added)
 
-  const hitEdge = g.neighbours('牛顿', 99).find((n) => n.name === '莱布尼茨')
-  const newEdge = g.neighbours('牛顿', 99).find((n) => n.name === '爱因斯坦')
-  check('命中边权重大于新边', hitEdge.w > newEdge.w, hitEdge.w + ' vs ' + newEdge.w)
+  const hitEdge = g.neighbours('牛顿', 99).find((n) => n.name === '苹果')
+  // 新边：另一对，权重应低于被命中过一次的
+  const g2 = new MemoryGraph({ i: 0.005, x: 0.03, y: 0.06, w0: 0.05, thr: 0.05, wmax: 0.9 })
+  g2.ingest(['甲', '乙'], 1)
+  const newEdge = g2.neighbours('甲', 99).find((n) => n.name === '乙')
+  check('命中边权重大于新边', hitEdge.w > newEdge.w, hitEdge.w.toFixed(4) + ' vs ' + newEdge.w.toFixed(4))
 }
 
 console.log('== 2. 衰减 ==')
@@ -286,6 +291,42 @@ console.log('== 15. 非名词驳回 ==')
   check('驳回后移出队列', !st.pendingGloss().includes('所以'))
   check('驳回后进入屏蔽表', st.blocked.has('所以'))
   check('其它名词不受影响', st.pendingGloss().includes('逻辑'))
+}
+
+console.log('== 16. 团压制单边（能成团就不建单边） ==')
+{
+  const words = ['书店', '概念', '信息', '纸质', '电子', '储存']
+  const text = '书店其实是误解，最初的概念里信息还是纸质承载的，随后被电子储存取代'
+  const positions = new Map()
+  for (const w of words) { const i = text.indexOf(w); positions.set(w, { start: Math.max(0, i), end: Math.max(0, i) + w.length }) }
+
+  const g = new MemoryGraph({ edgeMode: 'llm' })
+  g.ingest(words, 1, { positions, text })
+  check('6 词同句不建单边', g.edges.size === 0, 'edges=' + g.edges.size)
+  check('6 词同句形成 1 个团', g.cliques.size === 1, 'cliques=' + g.cliques.size)
+  check('团成员没有二元邻居', words.every((w) => g.neighbours(w).length === 0))
+  check('cliquesOf 能查到所属团', g.cliquesOf('书店').length === 1)
+
+  // 团成员必须存活，不能被当成孤立概念清掉
+  check('isolatePrune 不删团成员', g.isolatePrune() === 0)
+
+  // 旧数据：先有单边，后来成团，这些单边应能清掉
+  const g2 = new MemoryGraph({ edgeMode: 'llm' })
+  const p2 = new Map([['牛顿', { start: 0, end: 2 }], ['苹果', { start: 2, end: 4 }]])
+  g2.ingest(['牛顿', '苹果'], 1, { positions: p2, text: '牛顿苹果' })
+  check('两词先建单边', g2.edges.size === 1)
+  const p3 = new Map([['牛顿', { start: 0, end: 2 }], ['苹果', { start: 2, end: 4 }], ['引力', { start: 4, end: 6 }]])
+  g2.ingest(['牛顿', '苹果', '引力'], 1, { positions: p3, text: '牛顿苹果引力' })
+  // ingest 末尾会自动做这件事，所以此时旧单边应已被清掉
+  check('成团后旧单边已自动清掉', g2.edges.size === 0, 'edges=' + g2.edges.size)
+  check('再次同步无事可做', g2.syncCliqueEdges() === 0)
+  check('清理后团仍完整', g2.cliques.size === 1)
+
+  // 删除团成员时，团要一并拆掉
+  const g3 = new MemoryGraph({ edgeMode: 'llm' })
+  g3.ingest(words, 1, { positions, text })
+  g3.dropNode('书店')
+  check('删成员即拆团', g3.cliques.size === 0)
 }
 
 console.log('\n结果: ' + pass + ' 通过, ' + fail + ' 失败')

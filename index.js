@@ -660,10 +660,20 @@ async function ingestText(text, s = 1) {
       const n = store.nodes.get(name)
       if (!n) return sendJson(res, 404, { error: 'not-found' })
       const nb = store.graph.neighbours(name, 50)
+      // 团：同句多概念时该词所属的多边结构。界面要能看到，
+      // 否则团成员在「关联概念」里是空的，看起来像没建立任何关系。
+      const cliques = (typeof store.graph.cliquesOf === 'function' ? store.graph.cliquesOf(name) : [])
+        .map((c) => ({
+          members: c.names.filter((x) => x !== name),
+          gloss: c.gloss || '',
+          glossKind: c.glossKind || '',
+          size: c.names.length,
+        }))
       sendJson(res, 200, {
         name: n.name,
         gloss: n.gloss,
         manual: n.manual,
+        cliques,
         neighbours: nb.map((x) => {
           // 这一栏是「边」的信息，不是邻居词的词典释义：
           // 取这条边自己的关系解释，没有才退回邻居的概念解释。

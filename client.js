@@ -221,12 +221,13 @@ window.__ModuleLoader__.load({
       // 详情接口可能返回 {error}（概念刚被屏蔽、或记忆已切换），
       // 这里必须先判空，否则 .map 抛异常会让整个面板掉线。
       const neighbours = Array.isArray(data.neighbours) ? data.neighbours : []
+      const cliques = Array.isArray(data.cliques) ? data.cliques : []
       const glossList = Array.isArray(data.gloss) ? data.gloss : []
       const maxW = Math.max(0.001, ...neighbours.map((n) => n.w))
       return h('div', { className: 'asm-detailpad' },
         h('div', { className: 'asm-h2' }, data.name || ''),
         h('div', { className: 'asm-meta' },
-          neighbours.length + ' 条关联' + (data.manual ? ' · 手动添加' : '')),
+          neighbours.length + ' 条关联' + (cliques.length ? ' · 属 ' + cliques.length + ' 个组合' : '') + (data.manual ? ' · 手动添加' : '')),
         h('div', { className: 'asm-label' }, '解释（一词多义时可追加多条）'),
         glossList.length
           ? glossList.map((g, i) => h('div', { key: i, className: 'asm-gloss' },
@@ -254,6 +255,17 @@ window.__ModuleLoader__.load({
             onClick: () => onReject(data.name),
           }, '不是概念，屏蔽'),
         ),
+        // 组合（团）：同句 >=3 个概念时，关系整体存在这里，不再拆成两两边。
+        // 这类概念没有二元邻居，所以必须单独一栏，否则会显示「暂无关联」。
+        cliques.length
+          ? h('div', null,
+              h('div', { className: 'asm-label' }, '所属组合（同句多概念，整体一条解释）'),
+              cliques.map((c, i) => h('div', { key: i, className: 'asm-nb' },
+                h('span', { className: 'asm-nb-name' }, '+' + (c.size - 1) + ' 词'),
+                h('span', { className: 'asm-nb-gloss' },
+                  c.members.join('、') + (c.gloss ? '：' + c.gloss : '（待生成）')),
+              )))
+          : null,
         h('div', { className: 'asm-label' }, '关联概念（1 hop）'),
         neighbours.length
           ? neighbours.map((n) => h('div', { key: n.name, className: 'asm-nb' },
@@ -263,7 +275,7 @@ window.__ModuleLoader__.load({
               // 显示这条「边」的关系解释，而不是邻居词的词典释义
               h('span', { className: 'asm-nb-gloss' }, n.edgeGloss || ''),
             ))
-          : h('div', { className: 'asm-meta' }, '暂无过线关联'),
+          : h('div', { className: 'asm-meta' }, cliques.length ? '该词与其它词构成组合，没有单独的两两关联' : '暂无过线关联'),
       )
     }
 
